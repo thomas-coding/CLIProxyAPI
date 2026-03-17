@@ -208,6 +208,13 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if ctx != nil {
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			if stickyUserKey := strings.TrimSpace(ginCtx.GetHeader("X-NewAPI-User-ID")); stickyUserKey != "" {
+				meta[coreexecutor.StickyUserKeyMetadataKey] = stickyUserKey
+			}
+		}
+	}
 	return meta
 }
 

@@ -65,6 +65,7 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	stickyAssignmentTTL   = 10 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -95,8 +96,15 @@ type Result struct {
 	Success bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
 	RetryAfter *time.Duration
+	// StickyUserKey carries the downstream user key used for sticky auth assignment.
+	StickyUserKey string
 	// Error describes the failure when Success is false.
 	Error *Error
+}
+
+type stickyAssignment struct {
+	AuthID    string
+	ExpiresAt time.Time
 }
 
 // Selector chooses an auth candidate for execution.
@@ -135,6 +143,10 @@ type Manager struct {
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
+	// stickyByUserKey tracks short-lived downstream user to auth assignments.
+	stickyByUserKey map[string]stickyAssignment
+	// stickyCountByAuthID counts how many downstream users are currently bound to each auth.
+	stickyCountByAuthID map[string]int
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -174,14 +186,16 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		store:               store,
+		executors:           make(map[string]ProviderExecutor),
+		selector:            selector,
+		hook:                hook,
+		auths:               make(map[string]*Auth),
+		stickyByUserKey:     make(map[string]stickyAssignment),
+		stickyCountByAuthID: make(map[string]int),
+		providerOffsets:     make(map[string]int),
+		modelPoolOffsets:    make(map[string]int),
+		refreshSemaphore:    make(chan struct{}, refreshMaxConcurrency),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -483,7 +497,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, routeModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, routeModel, stickyUserKey string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -496,7 +510,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, StickyUserKey: stickyUserKey, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -526,13 +540,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: true, StickyUserKey: stickyUserKey})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel, stickyUserKey string) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
@@ -550,7 +564,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, StickyUserKey: stickyUserKey, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -571,7 +585,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, StickyUserKey: stickyUserKey, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -582,7 +596,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, StickyUserKey: stickyUserKey, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -592,12 +606,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: bootstrapErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, stickyUserKey, streamResult.Headers, nil, errCh), nil
 		}
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, StickyUserKey: stickyUserKey, Error: emptyErr}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -606,7 +620,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: emptyErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, stickyUserKey, streamResult.Headers, nil, errCh), nil
 		}
 
 		remaining := streamResult.Chunks
@@ -615,7 +629,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, stickyUserKey, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -978,6 +992,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	stickyUserKey := stickyUserKeyFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1012,7 +1027,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil, StickyUserKey: stickyUserKey}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1050,6 +1065,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	stickyUserKey := stickyUserKeyFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1084,7 +1100,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil, StickyUserKey: stickyUserKey}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1122,6 +1138,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	stickyUserKey := stickyUserKeyFromMetadata(opts.Metadata)
 	tried := make(map[string]struct{})
 	var lastErr error
 	for {
@@ -1149,7 +1166,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, stickyUserKey)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1233,6 +1250,279 @@ func publishSelectedAuthMetadata(meta map[string]any, authID string) {
 	if callback, ok := meta[cliproxyexecutor.SelectedAuthCallbackMetadataKey].(func(string)); ok && callback != nil {
 		callback(authID)
 	}
+}
+
+func stickyUserKeyFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[cliproxyexecutor.StickyUserKeyMetadataKey]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch val := raw.(type) {
+	case string:
+		return strings.TrimSpace(val)
+	case []byte:
+		return strings.TrimSpace(string(val))
+	default:
+		return ""
+	}
+}
+
+func (m *Manager) currentStickyAuthID(userKey string, now time.Time) string {
+	if m == nil {
+		return ""
+	}
+	userKey = strings.TrimSpace(userKey)
+	if userKey == "" {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneExpiredStickyAssignmentsLocked(now)
+	assignment, ok := m.stickyByUserKey[userKey]
+	if !ok {
+		return ""
+	}
+	return assignment.AuthID
+}
+
+func (m *Manager) stickyCountForAuth(authID string) int {
+	if m == nil {
+		return 0
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneExpiredStickyAssignmentsLocked(time.Now())
+	return m.stickyCountByAuthID[authID]
+}
+
+func (m *Manager) assignStickyAuth(userKey, authID string, expiresAt time.Time) {
+	if m == nil {
+		return
+	}
+	userKey = strings.TrimSpace(userKey)
+	authID = strings.TrimSpace(authID)
+	if userKey == "" || authID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.assignStickyAuthLocked(userKey, authID, expiresAt)
+}
+
+func (m *Manager) assignStickyAuthLocked(userKey, authID string, expiresAt time.Time) {
+	if m == nil {
+		return
+	}
+	m.pruneExpiredStickyAssignmentsLocked(time.Now())
+	if m.stickyByUserKey == nil {
+		m.stickyByUserKey = make(map[string]stickyAssignment)
+	}
+	if m.stickyCountByAuthID == nil {
+		m.stickyCountByAuthID = make(map[string]int)
+	}
+	if existing, ok := m.stickyByUserKey[userKey]; ok {
+		if existing.AuthID == authID {
+			existing.ExpiresAt = expiresAt
+			m.stickyByUserKey[userKey] = existing
+			return
+		}
+		m.clearStickyAssignmentLocked(userKey, "")
+	}
+	m.stickyByUserKey[userKey] = stickyAssignment{AuthID: authID, ExpiresAt: expiresAt}
+	m.stickyCountByAuthID[authID]++
+}
+
+func (m *Manager) clearStickyAssignment(userKey, authID string) {
+	if m == nil {
+		return
+	}
+	userKey = strings.TrimSpace(userKey)
+	if userKey == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clearStickyAssignmentLocked(userKey, authID)
+}
+
+func (m *Manager) clearStickyAssignmentLocked(userKey, authID string) {
+	if m == nil || m.stickyByUserKey == nil {
+		return
+	}
+	assignment, ok := m.stickyByUserKey[userKey]
+	if !ok {
+		return
+	}
+	authID = strings.TrimSpace(authID)
+	if authID != "" && assignment.AuthID != authID {
+		return
+	}
+	delete(m.stickyByUserKey, userKey)
+	if assignment.AuthID != "" && m.stickyCountByAuthID != nil {
+		if count := m.stickyCountByAuthID[assignment.AuthID]; count > 1 {
+			m.stickyCountByAuthID[assignment.AuthID] = count - 1
+		} else {
+			delete(m.stickyCountByAuthID, assignment.AuthID)
+		}
+	}
+}
+
+func (m *Manager) pruneExpiredStickyAssignmentsLocked(now time.Time) {
+	if m == nil || m.stickyByUserKey == nil {
+		return
+	}
+	for userKey, assignment := range m.stickyByUserKey {
+		if assignment.ExpiresAt.IsZero() || assignment.ExpiresAt.After(now) {
+			continue
+		}
+		m.clearStickyAssignmentLocked(userKey, assignment.AuthID)
+	}
+}
+
+func shouldClearStickyOnFailure(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	switch err.HTTPStatus {
+	case 401, 402, 403, 404, 408, 429, 500, 502, 503, 504:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) collectMixedCandidates(providers []string, model string, tried map[string]struct{}, pinnedAuthID string) ([]*Auth, error) {
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		providerKey := strings.TrimSpace(strings.ToLower(provider))
+		if providerKey == "" {
+			continue
+		}
+		providerSet[providerKey] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	candidates := make([]*Auth, 0, len(m.auths))
+	modelKey := strings.TrimSpace(model)
+	if modelKey != "" {
+		parsed := thinking.ParseSuffix(modelKey)
+		if parsed.ModelName != "" {
+			modelKey = strings.TrimSpace(parsed.ModelName)
+		}
+	}
+	registryRef := registry.GetGlobalRegistry()
+	for _, candidate := range m.auths {
+		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+		if providerKey == "" {
+			continue
+		}
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		if _, used := tried[candidate.ID]; used {
+			continue
+		}
+		if _, ok := m.executors[providerKey]; !ok {
+			continue
+		}
+		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	return candidates, nil
+}
+
+func (m *Manager) finalizeMixedSelection(selected *Auth) (*Auth, ProviderExecutor, string, error) {
+	if selected == nil {
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
+	}
+	providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
+	executor, okExecutor := m.Executor(providerKey)
+	if !okExecutor {
+		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
+	}
+	authCopy := selected.Clone()
+	if !selected.indexAssigned {
+		m.mu.Lock()
+		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+			current.EnsureIndex()
+			authCopy = current.Clone()
+		}
+		m.mu.Unlock()
+	}
+	return authCopy, executor, providerKey, nil
+}
+
+func (m *Manager) pickStickyMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, stickyUserKey string) (*Auth, ProviderExecutor, string, error) {
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	candidates, err := m.collectMixedCandidates(providers, model, tried, pinnedAuthID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	now := time.Now()
+	available, err := getAvailableAuths(candidates, "mixed", model, now)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if stickyAuthID := m.currentStickyAuthID(stickyUserKey, now); stickyAuthID != "" {
+		for _, candidate := range available {
+			if candidate != nil && candidate.ID == stickyAuthID {
+				m.assignStickyAuth(stickyUserKey, candidate.ID, now.Add(stickyAssignmentTTL))
+				return m.finalizeMixedSelection(candidate)
+			}
+		}
+		m.clearStickyAssignment(stickyUserKey, stickyAuthID)
+	}
+
+	minCount := -1
+	tied := make([]*Auth, 0, len(available))
+	for _, candidate := range available {
+		if candidate == nil {
+			continue
+		}
+		count := m.stickyCountForAuth(candidate.ID)
+		if minCount == -1 || count < minCount {
+			minCount = count
+			tied = []*Auth{candidate}
+			continue
+		}
+		if count == minCount {
+			tied = append(tied, candidate)
+		}
+	}
+	if len(tied) == 0 {
+		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	selected := tied[0]
+	if len(tied) > 1 {
+		selected, err = m.selector.Pick(ctx, "mixed", model, opts, tied)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	}
+	m.assignStickyAuth(stickyUserKey, selected.ID, now.Add(stickyAssignmentTTL))
+	return m.finalizeMixedSelection(selected)
 }
 
 func rewriteModelForAuth(model string, auth *Auth) string {
@@ -1594,6 +1884,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	var authSnapshot *Auth
 
 	m.mu.Lock()
+	if result.StickyUserKey != "" {
+		if result.Success {
+			m.assignStickyAuthLocked(result.StickyUserKey, result.AuthID, time.Now().Add(stickyAssignmentTTL))
+		} else if shouldClearStickyOnFailure(result.Error) {
+			m.clearStickyAssignmentLocked(result.StickyUserKey, result.AuthID)
+		}
+	}
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
 
@@ -2161,91 +2458,27 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 }
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	if stickyUserKey := stickyUserKeyFromMetadata(opts.Metadata); stickyUserKey != "" {
+		return m.pickStickyMixed(ctx, providers, model, opts, tried, stickyUserKey)
+	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-
-	providerSet := make(map[string]struct{}, len(providers))
-	for _, provider := range providers {
-		p := strings.TrimSpace(strings.ToLower(provider))
-		if p == "" {
-			continue
-		}
-		providerSet[p] = struct{}{}
-	}
-	if len(providerSet) == 0 {
-		return nil, nil, "", &Error{Code: "provider_not_found", Message: "no provider supplied"}
-	}
-
-	m.mu.RLock()
-	candidates := make([]*Auth, 0, len(m.auths))
-	modelKey := strings.TrimSpace(model)
-	// Always use base model name (without thinking suffix) for auth matching.
-	if modelKey != "" {
-		parsed := thinking.ParseSuffix(modelKey)
-		if parsed.ModelName != "" {
-			modelKey = strings.TrimSpace(parsed.ModelName)
-		}
-	}
-	registryRef := registry.GetGlobalRegistry()
-	for _, candidate := range m.auths {
-		if candidate == nil || candidate.Disabled {
-			continue
-		}
-		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
-			continue
-		}
-		providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
-		if providerKey == "" {
-			continue
-		}
-		if _, ok := providerSet[providerKey]; !ok {
-			continue
-		}
-		if _, used := tried[candidate.ID]; used {
-			continue
-		}
-		if _, ok := m.executors[providerKey]; !ok {
-			continue
-		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
-	if len(candidates) == 0 {
-		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+	candidates, err := m.collectMixedCandidates(providers, model, tried, pinnedAuthID)
+	if err != nil {
+		return nil, nil, "", err
 	}
 	selected, errPick := m.selector.Pick(ctx, "mixed", model, opts, candidates)
 	if errPick != nil {
-		m.mu.RUnlock()
 		return nil, nil, "", errPick
 	}
-	if selected == nil {
-		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "auth_not_found", Message: "selector returned no auth"}
-	}
-	providerKey := strings.TrimSpace(strings.ToLower(selected.Provider))
-	executor, okExecutor := m.executors[providerKey]
-	if !okExecutor {
-		m.mu.RUnlock()
-		return nil, nil, "", &Error{Code: "executor_not_found", Message: "executor not registered"}
-	}
-	authCopy := selected.Clone()
-	m.mu.RUnlock()
-	if !selected.indexAssigned {
-		m.mu.Lock()
-		if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
-			current.EnsureIndex()
-			authCopy = current.Clone()
-		}
-		m.mu.Unlock()
-	}
-	return authCopy, executor, providerKey, nil
+	return m.finalizeMixedSelection(selected)
 }
 
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	if !m.useSchedulerFastPath() {
 		return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+	}
+	if stickyUserKey := stickyUserKeyFromMetadata(opts.Metadata); stickyUserKey != "" {
+		return m.pickStickyMixed(ctx, providers, model, opts, tried, stickyUserKey)
 	}
 
 	eligibleProviders := make([]string, 0, len(providers))

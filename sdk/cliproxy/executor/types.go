@@ -11,6 +11,8 @@ import (
 const RequestedModelMetadataKey = "requested_model"
 
 const (
+	// StickyUserKeyMetadataKey carries a downstream user identifier for sticky auth selection.
+	StickyUserKeyMetadataKey = "sticky_user_key"
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.
