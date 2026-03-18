@@ -244,18 +244,30 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
+	categoryPriorities := collectCategoryPriorities(auths)
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntry(auth, categoryPriorities); entry != nil {
 			files = append(files, entry)
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
+		categoryI, _ := files[i]["auth_category"].(string)
+		categoryJ, _ := files[j]["auth_category"].(string)
+		if orderI, orderJ := authCategoryOrder(categoryI), authCategoryOrder(categoryJ); orderI != orderJ {
+			return orderI < orderJ
+		}
 		nameI, _ := files[i]["name"].(string)
 		nameJ, _ := files[j]["name"].(string)
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
-	c.JSON(200, gin.H{"files": files})
+	responseCategoryPriorities := gin.H{}
+	for category, snapshot := range categoryPriorities {
+		if snapshot.consistent {
+			responseCategoryPriorities[category] = snapshot.value
+		}
+	}
+	c.JSON(200, gin.H{"files": files, "category_priorities": responseCategoryPriorities})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -340,7 +352,46 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
-func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+type categoryPrioritySnapshot struct {
+	value      int
+	seen       bool
+	consistent bool
+}
+
+func collectCategoryPriorities(auths []*coreauth.Auth) map[string]categoryPrioritySnapshot {
+	result := make(map[string]categoryPrioritySnapshot)
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		category := coreauth.ResolveAuthCategory(auth)
+		priority := coreauth.AuthPriorityValue(auth)
+		snapshot := result[category]
+		if !snapshot.seen {
+			snapshot = categoryPrioritySnapshot{value: priority, seen: true, consistent: true}
+			result[category] = snapshot
+			continue
+		}
+		if snapshot.value != priority {
+			snapshot.consistent = false
+		}
+		result[category] = snapshot
+	}
+	return result
+}
+
+func authCategoryOrder(category string) int {
+	switch coreauth.NormalizeAuthCategory(category) {
+	case coreauth.AuthCategoryTeam:
+		return 0
+	case coreauth.AuthCategoryFree:
+		return 1
+	default:
+		return 2
+	}
+}
+
+func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, categoryPriorities map[string]categoryPrioritySnapshot) gin.H {
 	if auth == nil {
 		return nil
 	}
@@ -357,12 +408,16 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	category := coreauth.ResolveAuthCategory(auth)
+	priority := coreauth.AuthPriorityValue(auth)
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
 		"name":           name,
+		"file_name":      name,
 		"type":           strings.TrimSpace(auth.Provider),
 		"provider":       strings.TrimSpace(auth.Provider),
+		"channel":        strings.TrimSpace(auth.Provider),
 		"label":          auth.Label,
 		"status":         auth.Status,
 		"status_message": auth.StatusMessage,
@@ -371,6 +426,17 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"runtime_only":   runtimeOnly,
 		"source":         "memory",
 		"size":           int64(0),
+		"prefix":         strings.TrimSpace(auth.Prefix),
+		"proxy_url":      strings.TrimSpace(auth.ProxyURL),
+		"priority":       priority,
+		"auth_category":  category,
+	}
+	if snapshot, ok := categoryPriorities[category]; ok {
+		if snapshot.consistent {
+			entry["category_priority"] = snapshot.value
+		} else {
+			entry["category_priority_mixed"] = true
+		}
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -378,10 +444,14 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
 		if accountType != "" {
 			entry["account_type"] = accountType
+			entry["auth_type"] = accountType
 		}
 		if account != "" {
 			entry["account"] = account
 		}
+	}
+	if planType := strings.TrimSpace(authAttribute(auth, "plan_type")); planType != "" {
+		entry["plan_type"] = planType
 	}
 	if !auth.CreatedAt.IsZero() {
 		entry["created_at"] = auth.CreatedAt
@@ -759,6 +829,19 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
+	if priority, ok := coreauth.MetadataInt(metadata, "priority"); ok {
+		coreauth.SetAuthPriority(auth, priority)
+	}
+	if strings.EqualFold(provider, "codex") {
+		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+				if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+					auth.Attributes["plan_type"] = planType
+				}
+			}
+		}
+	}
+	coreauth.SetAuthCategory(auth, coreauth.ResolveAuthCategory(auth))
 	if existing, ok := h.authManager.GetByID(authID); ok {
 		auth.CreatedAt = existing.CreatedAt
 		if !hasLastRefresh {
@@ -839,7 +922,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority) of an auth file.
+// PatchAuthFileFields updates editable fields of an auth file, including category settings.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -847,10 +930,12 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
+		Name             string  `json:"name"`
+		Prefix           *string `json:"prefix"`
+		ProxyURL         *string `json:"proxy_url"`
+		Priority         *int    `json:"priority"`
+		AuthCategory     *string `json:"auth_category"`
+		CategoryPriority *int    `json:"category_priority"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -884,40 +969,73 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 
-	changed := false
+	directChanged := false
 	if req.Prefix != nil {
 		targetAuth.Prefix = *req.Prefix
-		changed = true
+		directChanged = true
 	}
 	if req.ProxyURL != nil {
 		targetAuth.ProxyURL = *req.ProxyURL
-		changed = true
+		directChanged = true
 	}
 	if req.Priority != nil {
-		if targetAuth.Metadata == nil {
-			targetAuth.Metadata = make(map[string]any)
-		}
-		if *req.Priority == 0 {
-			delete(targetAuth.Metadata, "priority")
-		} else {
-			targetAuth.Metadata["priority"] = *req.Priority
-		}
-		changed = true
+		coreauth.SetAuthPriority(targetAuth, *req.Priority)
+		directChanged = true
+	}
+	if req.AuthCategory != nil {
+		coreauth.SetAuthCategory(targetAuth, *req.AuthCategory)
+		directChanged = true
 	}
 
-	if !changed {
+	if !directChanged && req.CategoryPriority == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
 		return
 	}
 
-	targetAuth.UpdatedAt = time.Now()
+	if directChanged {
+		targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
+		if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+			return
+		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	response := gin.H{"status": "ok"}
+	if req.CategoryPriority != nil {
+		category := coreauth.ResolveAuthCategory(targetAuth)
+		updatedCount, err := h.updateCategoryPriority(ctx, category, *req.CategoryPriority)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update category priority: %v", err)})
+			return
+		}
+		response["category"] = category
+		response["updated_count"] = updatedCount
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *Handler) updateCategoryPriority(ctx context.Context, category string, priority int) (int, error) {
+	if h == nil || h.authManager == nil {
+		return 0, fmt.Errorf("core auth manager unavailable")
+	}
+	category = coreauth.NormalizeAuthCategory(category)
+	auths := h.authManager.List()
+	updated := 0
+	now := time.Now()
+	for _, auth := range auths {
+		if auth == nil || !coreauth.AuthCategoryMatches(auth, category) {
+			continue
+		}
+		coreauth.SetAuthPriority(auth, priority)
+		auth.UpdatedAt = now
+		if _, err := h.authManager.Update(ctx, auth); err != nil {
+			return updated, err
+		}
+		updated++
+	}
+	return updated, nil
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {

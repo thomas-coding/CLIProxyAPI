@@ -95,6 +95,12 @@ type Auth struct {
 	indexAssigned bool `json:"-"`
 }
 
+const (
+	AuthCategoryUnknown = "unknown"
+	AuthCategoryFree    = "free"
+	AuthCategoryTeam    = "team"
+)
+
 // QuotaState contains limiter tracking data for a credential.
 type QuotaState struct {
 	// Exceeded indicates the credential recently hit a quota error.
@@ -341,6 +347,169 @@ func parseIntAny(val any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func metadataString(meta map[string]any, keys ...string) string {
+	if meta == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if raw, ok := meta[key]; ok {
+			if value, okString := raw.(string); okString {
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func MetadataInt(meta map[string]any, keys ...string) (int, bool) {
+	if meta == nil {
+		return 0, false
+	}
+	for _, key := range keys {
+		if raw, ok := meta[key]; ok {
+			if parsed, okInt := parseIntAny(raw); okInt {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func NormalizeAuthCategory(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", AuthCategoryUnknown:
+		return AuthCategoryUnknown
+	case AuthCategoryFree:
+		return AuthCategoryFree
+	case AuthCategoryTeam, "business", "enterprise", "go":
+		return AuthCategoryTeam
+	default:
+		return AuthCategoryUnknown
+	}
+}
+
+func AuthCategoryFromPlanType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "free":
+		return AuthCategoryFree
+	case "team", "business", "enterprise", "go":
+		return AuthCategoryTeam
+	default:
+		return AuthCategoryUnknown
+	}
+}
+
+func InferAuthCategoryFromFileName(name string) string {
+	base := strings.ToLower(strings.TrimSpace(name))
+	if base == "" {
+		return AuthCategoryUnknown
+	}
+	if idx := strings.LastIndexByte(base, '.'); idx > 0 {
+		base = base[:idx]
+	}
+	for _, marker := range []string{"-team", "_team", ".team", " team"} {
+		if strings.Contains(base, marker) || strings.HasSuffix(base, "team") {
+			return AuthCategoryTeam
+		}
+	}
+	for _, marker := range []string{"-free", "_free", ".free", " free"} {
+		if strings.Contains(base, marker) || strings.HasSuffix(base, "free") {
+			return AuthCategoryFree
+		}
+	}
+	return AuthCategoryUnknown
+}
+
+func ResolveAuthCategory(auth *Auth) string {
+	if auth == nil {
+		return AuthCategoryUnknown
+	}
+	if category := NormalizeAuthCategory(metadataString(auth.Metadata, "auth_category", "auth-category", "category")); category != AuthCategoryUnknown {
+		return category
+	}
+	if auth.Attributes != nil {
+		if category := NormalizeAuthCategory(auth.Attributes["auth_category"]); category != AuthCategoryUnknown {
+			return category
+		}
+		if category := AuthCategoryFromPlanType(auth.Attributes["plan_type"]); category != AuthCategoryUnknown {
+			return category
+		}
+	}
+	if category := AuthCategoryFromPlanType(metadataString(auth.Metadata, "plan_type", "plan")); category != AuthCategoryUnknown {
+		return category
+	}
+	if category := InferAuthCategoryFromFileName(auth.FileName); category != AuthCategoryUnknown {
+		return category
+	}
+	if category := InferAuthCategoryFromFileName(auth.ID); category != AuthCategoryUnknown {
+		return category
+	}
+	return AuthCategoryUnknown
+}
+
+func AuthPriorityValue(auth *Auth) int {
+	if auth == nil {
+		return 0
+	}
+	if auth.Attributes != nil {
+		if raw := strings.TrimSpace(auth.Attributes["priority"]); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				return parsed
+			}
+		}
+	}
+	if parsed, ok := MetadataInt(auth.Metadata, "priority"); ok {
+		return parsed
+	}
+	return 0
+}
+
+func SetAuthCategory(auth *Auth, raw string) string {
+	if auth == nil {
+		return AuthCategoryUnknown
+	}
+	category := NormalizeAuthCategory(raw)
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	if category == AuthCategoryUnknown {
+		delete(auth.Metadata, "auth_category")
+		delete(auth.Attributes, "auth_category")
+		return ResolveAuthCategory(auth)
+	}
+	auth.Metadata["auth_category"] = category
+	auth.Attributes["auth_category"] = category
+	return category
+}
+
+func SetAuthPriority(auth *Auth, priority int) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	if priority == 0 {
+		delete(auth.Metadata, "priority")
+		delete(auth.Attributes, "priority")
+		return
+	}
+	auth.Metadata["priority"] = priority
+	auth.Attributes["priority"] = strconv.Itoa(priority)
+}
+
+func AuthCategoryMatches(auth *Auth, category string) bool {
+	return ResolveAuthCategory(auth) == NormalizeAuthCategory(category)
 }
 
 func (a *Auth) AccountInfo() (string, string) {

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -137,17 +136,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	// Read priority from auth file.
-	if rawPriority, ok := metadata["priority"]; ok {
-		switch v := rawPriority.(type) {
-		case float64:
-			a.Attributes["priority"] = strconv.Itoa(int(v))
-		case string:
-			priority := strings.TrimSpace(v)
-			if _, errAtoi := strconv.Atoi(priority); errAtoi == nil {
-				a.Attributes["priority"] = priority
-			}
-		}
+	if priority, ok := coreauth.MetadataInt(metadata, "priority"); ok {
+		coreauth.SetAuthPriority(a, priority)
 	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
@@ -160,6 +150,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	coreauth.SetAuthCategory(a, coreauth.ResolveAuthCategory(a))
 	if provider == "gemini-cli" {
 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
 			for _, v := range virtuals {
@@ -221,6 +212,9 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		if priorityVal, hasPriority := primary.Attributes["priority"]; hasPriority && priorityVal != "" {
 			attrs["priority"] = priorityVal
 		}
+		if categoryVal, hasCategory := primary.Attributes["auth_category"]; hasCategory && categoryVal != "" {
+			attrs["auth_category"] = categoryVal
+		}
 		metadataCopy := map[string]any{
 			"email":             email,
 			"project_id":        projectID,
@@ -255,6 +249,7 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 			UpdatedAt:  primary.UpdatedAt,
 			Runtime:    geminicli.NewVirtualCredential(projectID, shared),
 		}
+		coreauth.SetAuthCategory(virtual, coreauth.ResolveAuthCategory(primary))
 		virtuals = append(virtuals, virtual)
 	}
 	return virtuals

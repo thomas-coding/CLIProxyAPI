@@ -369,6 +369,57 @@ func TestFileSynthesizer_Synthesize_PriorityParsing(t *testing.T) {
 	}
 }
 
+func TestFileSynthesizer_Synthesize_AuthCategoryResolution(t *testing.T) {
+	tests := []struct {
+		name         string
+		fileName     string
+		metadata     map[string]any
+		wantCategory string
+	}{
+		{
+			name:         "explicit metadata wins",
+			fileName:     "codex-free.json",
+			metadata:     map[string]any{"type": "codex", "auth_category": "team"},
+			wantCategory: coreauth.AuthCategoryTeam,
+		},
+		{
+			name:         "filename fallback",
+			fileName:     "codex-team.json",
+			metadata:     map[string]any{"type": "codex"},
+			wantCategory: coreauth.AuthCategoryTeam,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			data, _ := json.Marshal(tt.metadata)
+			if err := os.WriteFile(filepath.Join(tempDir, tt.fileName), data, 0o644); err != nil {
+				t.Fatalf("failed to write auth file: %v", err)
+			}
+
+			synth := NewFileSynthesizer()
+			ctx := &SynthesisContext{
+				Config:      &config.Config{},
+				AuthDir:     tempDir,
+				Now:         time.Now(),
+				IDGenerator: NewStableIDGenerator(),
+			}
+
+			auths, err := synth.Synthesize(ctx)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(auths) != 1 {
+				t.Fatalf("expected 1 auth, got %d", len(auths))
+			}
+			if got := coreauth.ResolveAuthCategory(auths[0]); got != tt.wantCategory {
+				t.Fatalf("ResolveAuthCategory() = %q, want %q", got, tt.wantCategory)
+			}
+		})
+	}
+}
+
 func TestFileSynthesizer_Synthesize_OAuthExcludedModelsMerged(t *testing.T) {
 	tempDir := t.TempDir()
 	authData := map[string]any{
@@ -450,8 +501,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		Prefix:   "test-prefix",
 		ProxyURL: "http://proxy.local",
 		Attributes: map[string]string{
-			"source": "test-source",
-			"path":   "/path/to/auth",
+			"source":        "test-source",
+			"path":          "/path/to/auth",
+			"auth_category": coreauth.AuthCategoryTeam,
 		},
 	}
 	metadata := map[string]any{
@@ -511,6 +563,9 @@ func TestSynthesizeGeminiVirtualAuths_MultiProject(t *testing.T) {
 		}
 		if v.Attributes["gemini_virtual_project"] != projectIDs[i] {
 			t.Errorf("expected gemini_virtual_project=%s, got %s", projectIDs[i], v.Attributes["gemini_virtual_project"])
+		}
+		if v.Attributes["auth_category"] != coreauth.AuthCategoryTeam {
+			t.Errorf("expected auth_category=%s, got %s", coreauth.AuthCategoryTeam, v.Attributes["auth_category"])
 		}
 		if !strings.Contains(v.Label, "["+projectIDs[i]+"]") {
 			t.Errorf("expected label to contain [%s], got %s", projectIDs[i], v.Label)

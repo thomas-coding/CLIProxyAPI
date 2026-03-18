@@ -14,13 +14,15 @@ import (
 // editableField represents an editable field on an auth file.
 type editableField struct {
 	label string
-	key   string // API field key: "prefix", "proxy_url", "priority"
+	key   string
 }
 
 var authEditableFields = []editableField{
 	{label: "Prefix", key: "prefix"},
 	{label: "Proxy URL", key: "proxy_url"},
 	{label: "Priority", key: "priority"},
+	{label: "Auth Category", key: "auth_category"},
+	{label: "Category Priority", key: "category_priority"},
 }
 
 // authTabModel displays auth credential files with interactive management.
@@ -191,8 +193,16 @@ func (m authTabModel) renderContent() string {
 	for i, f := range m.files {
 		name := getString(f, "name")
 		channel := getString(f, "channel")
+		category := getString(f, "auth_category")
 		email := getString(f, "email")
 		disabled := getBool(f, "disabled")
+		priority := getAnyString(f, "category_priority")
+		if priority == "" {
+			priority = getAnyString(f, "priority")
+		}
+		if getBool(f, "category_priority_mixed") {
+			priority = "mixed"
+		}
 
 		statusIcon := successStyle.Render("●")
 		statusText := T("status_active")
@@ -216,9 +226,13 @@ func (m authTabModel) renderContent() string {
 		if len(displayEmail) > 28 {
 			displayEmail = displayEmail[:25] + "..."
 		}
+		displayCategory := category
+		if displayCategory == "" {
+			displayCategory = "unknown"
+		}
 
-		row := fmt.Sprintf("%s%s %-24s %-12s %-28s %s",
-			cursor, statusIcon, displayName, channel, displayEmail, statusText)
+		row := fmt.Sprintf("%s%s %-22s %-10s %-8s %-6s %-24s %s",
+			cursor, statusIcon, displayName, channel, displayCategory, priority, displayEmail, statusText)
 		sb.WriteString(rowStyle.Render(row))
 		sb.WriteString("\n")
 
@@ -272,6 +286,8 @@ func (m authTabModel) renderDetail(f map[string]any) string {
 	}{
 		{"Name", "name", false},
 		{"Channel", "channel", false},
+		{"Category", "auth_category", true},
+		{"Category Prio", "category_priority", true},
 		{"Email", "email", false},
 		{"Status", "status", false},
 		{"Status Msg", "status_message", false},
@@ -336,14 +352,18 @@ func (m authTabModel) handleEditInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) {
 		m.editing = false
 		m.editInput.Blur()
 		fields := map[string]any{}
-		if fieldKey == "priority" {
-			p, err := strconv.Atoi(value)
-			if err != nil {
-				return m, func() tea.Msg {
-					return authActionMsg{err: fmt.Errorf("%s: %s", T("invalid_int"), value)}
+		if fieldKey == "priority" || fieldKey == "category_priority" {
+			if strings.TrimSpace(value) == "" {
+				fields[fieldKey] = 0
+			} else {
+				p, err := strconv.Atoi(value)
+				if err != nil {
+					return m, func() tea.Msg {
+						return authActionMsg{err: fmt.Errorf("%s: %s", T("invalid_int"), value)}
+					}
 				}
+				fields[fieldKey] = p
 			}
-			fields[fieldKey] = p
 		} else {
 			fields[fieldKey] = value
 		}
@@ -445,6 +465,10 @@ func (m authTabModel) handleNormalInput(msg tea.KeyMsg) (authTabModel, tea.Cmd) 
 		return m, m.startEdit(1) // proxy_url
 	case "3":
 		return m, m.startEdit(2) // priority
+	case "4":
+		return m, m.startEdit(3) // auth_category
+	case "5":
+		return m, m.startEdit(4) // category_priority
 	case "r":
 		m.status = ""
 		return m, m.fetchFiles

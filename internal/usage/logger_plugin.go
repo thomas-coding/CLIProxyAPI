@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -65,7 +66,8 @@ type RequestStatistics struct {
 	failureCount  int64
 	totalTokens   int64
 
-	apis map[string]*apiStats
+	apis       map[string]*apiStats
+	categories map[string]*categoryStats
 
 	requestsByDay  map[string]int64
 	requestsByHour map[int]int64
@@ -80,6 +82,14 @@ type apiStats struct {
 	Models        map[string]*modelStats
 }
 
+type categoryStats struct {
+	TotalRequests int64
+	SuccessCount  int64
+	FailureCount  int64
+	TotalTokens   int64
+	Models        map[string]*modelStats
+}
+
 // modelStats holds aggregated metrics for a specific model within an API.
 type modelStats struct {
 	TotalRequests int64
@@ -89,11 +99,12 @@ type modelStats struct {
 
 // RequestDetail stores the timestamp and token usage for a single request.
 type RequestDetail struct {
-	Timestamp time.Time  `json:"timestamp"`
-	Source    string     `json:"source"`
-	AuthIndex string     `json:"auth_index"`
-	Tokens    TokenStats `json:"tokens"`
-	Failed    bool       `json:"failed"`
+	Timestamp    time.Time  `json:"timestamp"`
+	Source       string     `json:"source"`
+	AuthIndex    string     `json:"auth_index"`
+	AuthCategory string     `json:"auth_category,omitempty"`
+	Tokens       TokenStats `json:"tokens"`
+	Failed       bool       `json:"failed"`
 }
 
 // TokenStats captures the token usage breakdown for a request.
@@ -112,7 +123,8 @@ type StatisticsSnapshot struct {
 	FailureCount  int64 `json:"failure_count"`
 	TotalTokens   int64 `json:"total_tokens"`
 
-	APIs map[string]APISnapshot `json:"apis"`
+	APIs       map[string]APISnapshot      `json:"apis"`
+	Categories map[string]CategorySnapshot `json:"auth_categories,omitempty"`
 
 	RequestsByDay  map[string]int64 `json:"requests_by_day"`
 	RequestsByHour map[string]int64 `json:"requests_by_hour"`
@@ -123,6 +135,14 @@ type StatisticsSnapshot struct {
 // APISnapshot summarises metrics for a single API key.
 type APISnapshot struct {
 	TotalRequests int64                    `json:"total_requests"`
+	TotalTokens   int64                    `json:"total_tokens"`
+	Models        map[string]ModelSnapshot `json:"models"`
+}
+
+type CategorySnapshot struct {
+	TotalRequests int64                    `json:"total_requests"`
+	SuccessCount  int64                    `json:"success_count"`
+	FailureCount  int64                    `json:"failure_count"`
 	TotalTokens   int64                    `json:"total_tokens"`
 	Models        map[string]ModelSnapshot `json:"models"`
 }
@@ -143,6 +163,7 @@ func GetRequestStatistics() *RequestStatistics { return defaultRequestStatistics
 func NewRequestStatistics() *RequestStatistics {
 	return &RequestStatistics{
 		apis:           make(map[string]*apiStats),
+		categories:     make(map[string]*categoryStats),
 		requestsByDay:  make(map[string]int64),
 		requestsByHour: make(map[int]int64),
 		tokensByDay:    make(map[string]int64),
@@ -173,6 +194,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		failed = !resolveSuccess(ctx)
 	}
 	success := !failed
+	authCategory := normalizeAuthCategory(record.AuthCategory)
 	modelName := record.Model
 	if modelName == "" {
 		modelName = "unknown"
@@ -197,11 +219,26 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 		s.apis[statsKey] = stats
 	}
 	s.updateAPIStats(stats, modelName, RequestDetail{
-		Timestamp: timestamp,
-		Source:    record.Source,
-		AuthIndex: record.AuthIndex,
-		Tokens:    detail,
-		Failed:    failed,
+		Timestamp:    timestamp,
+		Source:       record.Source,
+		AuthIndex:    record.AuthIndex,
+		AuthCategory: authCategory,
+		Tokens:       detail,
+		Failed:       failed,
+	})
+
+	categoryStatsValue, ok := s.categories[authCategory]
+	if !ok {
+		categoryStatsValue = &categoryStats{Models: make(map[string]*modelStats)}
+		s.categories[authCategory] = categoryStatsValue
+	}
+	s.updateCategoryStats(categoryStatsValue, modelName, success, RequestDetail{
+		Timestamp:    timestamp,
+		Source:       record.Source,
+		AuthIndex:    record.AuthIndex,
+		AuthCategory: authCategory,
+		Tokens:       detail,
+		Failed:       failed,
 	})
 
 	s.requestsByDay[dayKey]++
@@ -212,6 +249,24 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
 	stats.TotalRequests++
+	stats.TotalTokens += detail.Tokens.TotalTokens
+	modelStatsValue, ok := stats.Models[model]
+	if !ok {
+		modelStatsValue = &modelStats{}
+		stats.Models[model] = modelStatsValue
+	}
+	modelStatsValue.TotalRequests++
+	modelStatsValue.TotalTokens += detail.Tokens.TotalTokens
+	modelStatsValue.Details = append(modelStatsValue.Details, detail)
+}
+
+func (s *RequestStatistics) updateCategoryStats(stats *categoryStats, model string, success bool, detail RequestDetail) {
+	stats.TotalRequests++
+	if success {
+		stats.SuccessCount++
+	} else {
+		stats.FailureCount++
+	}
 	stats.TotalTokens += detail.Tokens.TotalTokens
 	modelStatsValue, ok := stats.Models[model]
 	if !ok {
@@ -255,6 +310,27 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 			}
 		}
 		result.APIs[apiName] = apiSnapshot
+	}
+
+	result.Categories = make(map[string]CategorySnapshot, len(s.categories))
+	for categoryName, stats := range s.categories {
+		categorySnapshot := CategorySnapshot{
+			TotalRequests: stats.TotalRequests,
+			SuccessCount:  stats.SuccessCount,
+			FailureCount:  stats.FailureCount,
+			TotalTokens:   stats.TotalTokens,
+			Models:        make(map[string]ModelSnapshot, len(stats.Models)),
+		}
+		for modelName, modelStatsValue := range stats.Models {
+			requestDetails := make([]RequestDetail, len(modelStatsValue.Details))
+			copy(requestDetails, modelStatsValue.Details)
+			categorySnapshot.Models[modelName] = ModelSnapshot{
+				TotalRequests: modelStatsValue.TotalRequests,
+				TotalTokens:   modelStatsValue.TotalTokens,
+				Details:       requestDetails,
+			}
+		}
+		result.Categories[categoryName] = categorySnapshot
 	}
 
 	result.RequestsByDay = make(map[string]int64, len(s.requestsByDay))
@@ -308,6 +384,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 				continue
 			}
 			for _, detail := range modelStatsValue.Details {
+				detail.AuthCategory = normalizeAuthCategory(detail.AuthCategory)
 				seen[dedupKey(apiName, modelName, detail)] = struct{}{}
 			}
 		}
@@ -332,6 +409,7 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 			}
 			for _, detail := range modelSnapshot.Details {
 				detail.Tokens = normaliseTokenStats(detail.Tokens)
+				detail.AuthCategory = normalizeAuthCategory(detail.AuthCategory)
 				if detail.Timestamp.IsZero() {
 					detail.Timestamp = time.Now()
 				}
@@ -365,6 +443,12 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.totalTokens += totalTokens
 
 	s.updateAPIStats(stats, modelName, detail)
+	categoryStatsValue, ok := s.categories[normalizeAuthCategory(detail.AuthCategory)]
+	if !ok || categoryStatsValue == nil {
+		categoryStatsValue = &categoryStats{Models: make(map[string]*modelStats)}
+		s.categories[normalizeAuthCategory(detail.AuthCategory)] = categoryStatsValue
+	}
+	s.updateCategoryStats(categoryStatsValue, modelName, !detail.Failed, detail)
 
 	dayKey := detail.Timestamp.Format("2006-01-02")
 	hourKey := detail.Timestamp.Hour()
@@ -379,12 +463,13 @@ func dedupKey(apiName, modelName string, detail RequestDetail) string {
 	timestamp := detail.Timestamp.UTC().Format(time.RFC3339Nano)
 	tokens := normaliseTokenStats(detail.Tokens)
 	return fmt.Sprintf(
-		"%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
+		"%s|%s|%s|%s|%s|%s|%t|%d|%d|%d|%d|%d",
 		apiName,
 		modelName,
 		timestamp,
 		detail.Source,
 		detail.AuthIndex,
+		normalizeAuthCategory(detail.AuthCategory),
 		detail.Failed,
 		tokens.InputTokens,
 		tokens.OutputTokens,
@@ -469,4 +554,12 @@ func formatHour(hour int) string {
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+func normalizeAuthCategory(raw string) string {
+	category := coreauth.NormalizeAuthCategory(raw)
+	if category == "" {
+		return coreauth.AuthCategoryUnknown
+	}
+	return category
 }

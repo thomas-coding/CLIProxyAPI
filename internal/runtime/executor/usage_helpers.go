@@ -16,14 +16,15 @@ import (
 )
 
 type usageReporter struct {
-	provider    string
-	model       string
-	authID      string
-	authIndex   string
-	apiKey      string
-	source      string
-	requestedAt time.Time
-	once        sync.Once
+	provider     string
+	model        string
+	authID       string
+	authIndex    string
+	authCategory string
+	apiKey       string
+	source       string
+	requestedAt  time.Time
+	once         sync.Once
 }
 
 func newUsageReporter(ctx context.Context, provider, model string, auth *cliproxyauth.Auth) *usageReporter {
@@ -38,6 +39,7 @@ func newUsageReporter(ctx context.Context, provider, model string, auth *cliprox
 	if auth != nil {
 		reporter.authID = auth.ID
 		reporter.authIndex = auth.EnsureIndex()
+		reporter.authCategory = cliproxyauth.ResolveAuthCategory(auth)
 	}
 	return reporter
 }
@@ -74,15 +76,16 @@ func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Det
 	}
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, usage.Record{
-			Provider:    r.provider,
-			Model:       r.model,
-			Source:      r.source,
-			APIKey:      r.apiKey,
-			AuthID:      r.authID,
-			AuthIndex:   r.authIndex,
-			RequestedAt: r.requestedAt,
-			Failed:      failed,
-			Detail:      detail,
+			Provider:     r.provider,
+			Model:        r.model,
+			Source:       r.source,
+			APIKey:       r.apiKey,
+			AuthID:       r.authID,
+			AuthIndex:    r.authIndex,
+			AuthCategory: r.authCategory,
+			RequestedAt:  r.requestedAt,
+			Failed:       failed,
+			Detail:       detail,
 		})
 	})
 }
@@ -97,15 +100,16 @@ func (r *usageReporter) ensurePublished(ctx context.Context) {
 	}
 	r.once.Do(func() {
 		usage.PublishRecord(ctx, usage.Record{
-			Provider:    r.provider,
-			Model:       r.model,
-			Source:      r.source,
-			APIKey:      r.apiKey,
-			AuthID:      r.authID,
-			AuthIndex:   r.authIndex,
-			RequestedAt: r.requestedAt,
-			Failed:      false,
-			Detail:      usage.Detail{},
+			Provider:     r.provider,
+			Model:        r.model,
+			Source:       r.source,
+			APIKey:       r.apiKey,
+			AuthID:       r.authID,
+			AuthIndex:    r.authIndex,
+			AuthCategory: r.authCategory,
+			RequestedAt:  r.requestedAt,
+			Failed:       false,
+			Detail:       usage.Detail{},
 		})
 	})
 }

@@ -1,6 +1,10 @@
 package executor
 
-import "testing"
+import (
+	"testing"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+)
 
 func TestParseOpenAIUsageChatCompletions(t *testing.T) {
 	data := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`)
@@ -39,5 +43,20 @@ func TestParseOpenAIUsageResponses(t *testing.T) {
 	}
 	if detail.ReasoningTokens != 9 {
 		t.Fatalf("reasoning tokens = %d, want %d", detail.ReasoningTokens, 9)
+	}
+}
+
+func TestNewUsageReporter_CapturesAuthCategory(t *testing.T) {
+	reporter := newUsageReporter(nil, "codex", "gpt-5", &cliproxyauth.Auth{
+		ID:       "auth-team",
+		FileName: "team.json",
+		Provider: "codex",
+		Metadata: map[string]any{"auth_category": "team"},
+	})
+	if reporter == nil {
+		t.Fatal("expected non-nil reporter")
+	}
+	if reporter.authCategory != cliproxyauth.AuthCategoryTeam {
+		t.Fatalf("authCategory = %q, want %q", reporter.authCategory, cliproxyauth.AuthCategoryTeam)
 	}
 }
