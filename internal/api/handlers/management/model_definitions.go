@@ -31,3 +31,17 @@ func (h *Handler) GetStaticModelDefinitions(c *gin.Context) {
 		"models":  models,
 	})
 }
+
+// GetAvailableModels returns the currently available OpenAI-compatible model list
+// from the active CLIProxy runtime registry. This avoids relying on the public
+// /v1/models ingress path from the management UI.
+func (h *Handler) GetAvailableModels(c *gin.Context) {
+	models := registry.GetGlobalRegistry().GetAvailableModels("openai")
+	if models == nil {
+		models = make([]map[string]any, 0)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"models": models,
+	})
+}
