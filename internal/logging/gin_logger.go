@@ -40,17 +40,19 @@ const skipGinLogKey = "__gin_skip_request_logging__"
 func GinLogrusLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
+		SetGinRequestStartTime(c, start)
 		path := c.Request.URL.Path
 		raw := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
+		ctx := WithRequestStartTime(c.Request.Context(), start)
 
 		// Only generate request ID for AI API paths
 		var requestID string
 		if isAIAPIPath(path) {
 			requestID = GenerateRequestID()
 			SetGinRequestID(c, requestID)
-			ctx := WithRequestID(c.Request.Context(), requestID)
-			c.Request = c.Request.WithContext(ctx)
+			ctx = WithRequestID(ctx, requestID)
 		}
+		c.Request = c.Request.WithContext(ctx)
 
 		c.Next()
 

@@ -39,6 +39,14 @@ type upstreamRequestLog struct {
 
 type upstreamAttempt struct {
 	index                int
+	path                 string
+	provider             string
+	selectedAuthID       string
+	method               string
+	upstreamURL          string
+	requestStartedAt     time.Time
+	responseHeadersAt    time.Time
+	firstChunkAt         time.Time
 	request              string
 	response             *strings.Builder
 	responseIntroWritten bool
@@ -47,13 +55,13 @@ type upstreamAttempt struct {
 	bodyStarted          bool
 	bodyHasContent       bool
 	errorWritten         bool
+	perfHeadersLogged    bool
+	perfFirstChunkLogged bool
+	perfErrorLogged      bool
 }
 
 // recordAPIRequest stores the upstream request metadata in Gin context for request logging.
 func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequestLog) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
@@ -61,70 +69,85 @@ func recordAPIRequest(ctx context.Context, cfg *config.Config, info upstreamRequ
 
 	attempts := getAttempts(ginCtx)
 	index := len(attempts) + 1
-
-	builder := &strings.Builder{}
-	builder.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
-	builder.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
-	if info.URL != "" {
-		builder.WriteString(fmt.Sprintf("Upstream URL: %s\n", info.URL))
-	} else {
-		builder.WriteString("Upstream URL: <unknown>\n")
-	}
-	if info.Method != "" {
-		builder.WriteString(fmt.Sprintf("HTTP Method: %s\n", info.Method))
-	}
-	if auth := formatAuthInfo(info); auth != "" {
-		builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
-	}
-	builder.WriteString("\nHeaders:\n")
-	writeHeaders(builder, info.Headers)
-	builder.WriteString("\nBody:\n")
-	if len(info.Body) > 0 {
-		builder.WriteString(string(info.Body))
-	} else {
-		builder.WriteString("<empty>")
-	}
-	builder.WriteString("\n\n")
+	now := time.Now()
 
 	attempt := &upstreamAttempt{
-		index:    index,
-		request:  builder.String(),
-		response: &strings.Builder{},
+		index:            index,
+		path:             perfRequestPath(ginCtx),
+		provider:         strings.TrimSpace(info.Provider),
+		selectedAuthID:   strings.TrimSpace(info.AuthID),
+		method:           strings.TrimSpace(info.Method),
+		upstreamURL:      strings.TrimSpace(info.URL),
+		requestStartedAt: now,
+		response:         &strings.Builder{},
+	}
+	if cfg != nil && cfg.RequestLog {
+		builder := &strings.Builder{}
+		builder.WriteString(fmt.Sprintf("=== API REQUEST %d ===\n", index))
+		builder.WriteString(fmt.Sprintf("Timestamp: %s\n", now.Format(time.RFC3339Nano)))
+		if info.URL != "" {
+			builder.WriteString(fmt.Sprintf("Upstream URL: %s\n", info.URL))
+		} else {
+			builder.WriteString("Upstream URL: <unknown>\n")
+		}
+		if info.Method != "" {
+			builder.WriteString(fmt.Sprintf("HTTP Method: %s\n", info.Method))
+		}
+		if auth := formatAuthInfo(info); auth != "" {
+			builder.WriteString(fmt.Sprintf("Auth: %s\n", auth))
+		}
+		builder.WriteString("\nHeaders:\n")
+		writeHeaders(builder, info.Headers)
+		builder.WriteString("\nBody:\n")
+		if len(info.Body) > 0 {
+			builder.WriteString(string(info.Body))
+		} else {
+			builder.WriteString("<empty>")
+		}
+		builder.WriteString("\n\n")
+		attempt.request = builder.String()
 	}
 	attempts = append(attempts, attempt)
 	ginCtx.Set(apiAttemptsKey, attempts)
-	updateAggregatedRequest(ginCtx, attempts)
+	if cfg != nil && cfg.RequestLog {
+		updateAggregatedRequest(ginCtx, attempts)
+	}
+	logUpstreamPerfDispatch(ctx, ginCtx, attempt)
 }
 
 // recordAPIResponseMetadata captures upstream response status/header information for the latest attempt.
 func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status int, headers http.Header) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
-	ensureResponseIntro(attempt)
-
-	if status > 0 && !attempt.statusWritten {
-		attempt.response.WriteString(fmt.Sprintf("Status: %d\n", status))
-		attempt.statusWritten = true
+	if attempt.responseHeadersAt.IsZero() {
+		attempt.responseHeadersAt = time.Now()
 	}
-	if !attempt.headersWritten {
-		attempt.response.WriteString("Headers:\n")
-		writeHeaders(attempt.response, headers)
-		attempt.headersWritten = true
-		attempt.response.WriteString("\n")
-	}
+	logUpstreamPerfHeaders(ctx, ginCtx, attempt, status)
 
-	updateAggregatedResponse(ginCtx, attempts)
+	if cfg != nil && cfg.RequestLog {
+		ensureResponseIntro(attempt)
+
+		if status > 0 && !attempt.statusWritten {
+			attempt.response.WriteString(fmt.Sprintf("Status: %d\n", status))
+			attempt.statusWritten = true
+		}
+		if !attempt.headersWritten {
+			attempt.response.WriteString("Headers:\n")
+			writeHeaders(attempt.response, headers)
+			attempt.headersWritten = true
+			attempt.response.WriteString("\n")
+		}
+
+		updateAggregatedResponse(ginCtx, attempts)
+	}
 }
 
 // recordAPIResponseError adds an error entry for the latest attempt when no HTTP response is available.
 func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) {
-	if cfg == nil || !cfg.RequestLog || err == nil {
+	if err == nil {
 		return
 	}
 	ginCtx := ginContextFrom(ctx)
@@ -132,26 +155,27 @@ func recordAPIResponseError(ctx context.Context, cfg *config.Config, err error) 
 		return
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
-	ensureResponseIntro(attempt)
+	logUpstreamPerfError(ctx, ginCtx, attempt, err)
 
-	if attempt.bodyStarted && !attempt.bodyHasContent {
-		// Ensure body does not stay empty marker if error arrives first.
-		attempt.bodyStarted = false
-	}
-	if attempt.errorWritten {
-		attempt.response.WriteString("\n")
-	}
-	attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
-	attempt.errorWritten = true
+	if cfg != nil && cfg.RequestLog {
+		ensureResponseIntro(attempt)
 
-	updateAggregatedResponse(ginCtx, attempts)
+		if attempt.bodyStarted && !attempt.bodyHasContent {
+			// Ensure body does not stay empty marker if error arrives first.
+			attempt.bodyStarted = false
+		}
+		if attempt.errorWritten {
+			attempt.response.WriteString("\n")
+		}
+		attempt.response.WriteString(fmt.Sprintf("Error: %s\n", err.Error()))
+		attempt.errorWritten = true
+
+		updateAggregatedResponse(ginCtx, attempts)
+	}
 }
 
 // appendAPIResponseChunk appends an upstream response chunk to Gin context for request logging.
 func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byte) {
-	if cfg == nil || !cfg.RequestLog {
-		return
-	}
 	data := bytes.TrimSpace(chunk)
 	if len(data) == 0 {
 		return
@@ -161,25 +185,32 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 		return
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
-	ensureResponseIntro(attempt)
+	if attempt.firstChunkAt.IsZero() {
+		attempt.firstChunkAt = time.Now()
+	}
+	logUpstreamPerfFirstChunk(ctx, ginCtx, attempt)
 
-	if !attempt.headersWritten {
-		attempt.response.WriteString("Headers:\n")
-		writeHeaders(attempt.response, nil)
-		attempt.headersWritten = true
-		attempt.response.WriteString("\n")
-	}
-	if !attempt.bodyStarted {
-		attempt.response.WriteString("Body:\n")
-		attempt.bodyStarted = true
-	}
-	if attempt.bodyHasContent {
-		attempt.response.WriteString("\n\n")
-	}
-	attempt.response.WriteString(string(data))
-	attempt.bodyHasContent = true
+	if cfg != nil && cfg.RequestLog {
+		ensureResponseIntro(attempt)
 
-	updateAggregatedResponse(ginCtx, attempts)
+		if !attempt.headersWritten {
+			attempt.response.WriteString("Headers:\n")
+			writeHeaders(attempt.response, nil)
+			attempt.headersWritten = true
+			attempt.response.WriteString("\n")
+		}
+		if !attempt.bodyStarted {
+			attempt.response.WriteString("Body:\n")
+			attempt.bodyStarted = true
+		}
+		if attempt.bodyHasContent {
+			attempt.response.WriteString("\n\n")
+		}
+		attempt.response.WriteString(string(data))
+		attempt.bodyHasContent = true
+
+		updateAggregatedResponse(ginCtx, attempts)
+	}
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {
@@ -203,9 +234,11 @@ func ensureAttempt(ginCtx *gin.Context) ([]*upstreamAttempt, *upstreamAttempt) {
 	attempts := getAttempts(ginCtx)
 	if len(attempts) == 0 {
 		attempt := &upstreamAttempt{
-			index:    1,
-			request:  "=== API REQUEST 1 ===\n<missing>\n\n",
-			response: &strings.Builder{},
+			index:            1,
+			path:             perfRequestPath(ginCtx),
+			requestStartedAt: time.Now(),
+			request:          "=== API REQUEST 1 ===\n<missing>\n\n",
+			response:         &strings.Builder{},
 		}
 		attempts = []*upstreamAttempt{attempt}
 		ginCtx.Set(apiAttemptsKey, attempts)
@@ -257,6 +290,122 @@ func updateAggregatedResponse(ginCtx *gin.Context, attempts []*upstreamAttempt) 
 		}
 	}
 	ginCtx.Set(apiResponseKey, []byte(builder.String()))
+}
+
+func shouldLogUpstreamPerf(path string) bool {
+	return strings.HasPrefix(path, "/v1/chat/completions") ||
+		strings.HasPrefix(path, "/v1/completions") ||
+		strings.HasPrefix(path, "/v1/responses")
+}
+
+func perfRequestPath(ginCtx *gin.Context) string {
+	if ginCtx == nil || ginCtx.Request == nil || ginCtx.Request.URL == nil {
+		return ""
+	}
+	return ginCtx.Request.URL.Path
+}
+
+func perfRequestStart(ctx context.Context, ginCtx *gin.Context) time.Time {
+	if start := logging.GetRequestStartTime(ctx); !start.IsZero() {
+		return start
+	}
+	if start := logging.GetGinRequestStartTime(ginCtx); !start.IsZero() {
+		return start
+	}
+	return time.Time{}
+}
+
+func durationMillis(start, end time.Time) int64 {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+func valueOrUnknown(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "<unknown>"
+	}
+	return value
+}
+
+func logUpstreamPerfDispatch(ctx context.Context, ginCtx *gin.Context, attempt *upstreamAttempt) {
+	if attempt == nil || !shouldLogUpstreamPerf(attempt.path) {
+		return
+	}
+	requestStart := perfRequestStart(ctx, ginCtx)
+	logWithRequestID(ctx).Infof(
+		"[perf] cliproxy upstream phase=dispatch path=%s attempt=%d provider=%s auth_id=%s method=%s request_ms=%d upstream_url=%q",
+		valueOrUnknown(attempt.path),
+		attempt.index,
+		valueOrUnknown(attempt.provider),
+		valueOrUnknown(attempt.selectedAuthID),
+		valueOrUnknown(attempt.method),
+		durationMillis(requestStart, attempt.requestStartedAt),
+		valueOrUnknown(attempt.upstreamURL),
+	)
+}
+
+func logUpstreamPerfHeaders(ctx context.Context, ginCtx *gin.Context, attempt *upstreamAttempt, status int) {
+	if attempt == nil || attempt.perfHeadersLogged || !shouldLogUpstreamPerf(attempt.path) {
+		return
+	}
+	attempt.perfHeadersLogged = true
+	requestStart := perfRequestStart(ctx, ginCtx)
+	logWithRequestID(ctx).Infof(
+		"[perf] cliproxy upstream phase=headers path=%s attempt=%d provider=%s auth_id=%s status=%d request_ms=%d upstream_ms=%d",
+		valueOrUnknown(attempt.path),
+		attempt.index,
+		valueOrUnknown(attempt.provider),
+		valueOrUnknown(attempt.selectedAuthID),
+		status,
+		durationMillis(requestStart, attempt.responseHeadersAt),
+		durationMillis(attempt.requestStartedAt, attempt.responseHeadersAt),
+	)
+}
+
+func logUpstreamPerfFirstChunk(ctx context.Context, ginCtx *gin.Context, attempt *upstreamAttempt) {
+	if attempt == nil || attempt.perfFirstChunkLogged || !shouldLogUpstreamPerf(attempt.path) {
+		return
+	}
+	attempt.perfFirstChunkLogged = true
+	requestStart := perfRequestStart(ctx, ginCtx)
+	logWithRequestID(ctx).Infof(
+		"[perf] cliproxy upstream phase=first_chunk path=%s attempt=%d provider=%s auth_id=%s request_ms=%d upstream_ms=%d headers_to_first_chunk_ms=%d",
+		valueOrUnknown(attempt.path),
+		attempt.index,
+		valueOrUnknown(attempt.provider),
+		valueOrUnknown(attempt.selectedAuthID),
+		durationMillis(requestStart, attempt.firstChunkAt),
+		durationMillis(attempt.requestStartedAt, attempt.firstChunkAt),
+		durationMillis(attempt.responseHeadersAt, attempt.firstChunkAt),
+	)
+}
+
+func logUpstreamPerfError(ctx context.Context, ginCtx *gin.Context, attempt *upstreamAttempt, err error) {
+	if attempt == nil || err == nil || attempt.perfErrorLogged || !shouldLogUpstreamPerf(attempt.path) {
+		return
+	}
+	attempt.perfErrorLogged = true
+	at := time.Now()
+	stage := "pre_headers"
+	if !attempt.firstChunkAt.IsZero() {
+		stage = "post_first_chunk"
+	} else if !attempt.responseHeadersAt.IsZero() {
+		stage = "post_headers"
+	}
+	requestStart := perfRequestStart(ctx, ginCtx)
+	logWithRequestID(ctx).Infof(
+		"[perf] cliproxy upstream phase=error path=%s attempt=%d provider=%s auth_id=%s stage=%s request_ms=%d upstream_ms=%d err=%q",
+		valueOrUnknown(attempt.path),
+		attempt.index,
+		valueOrUnknown(attempt.provider),
+		valueOrUnknown(attempt.selectedAuthID),
+		stage,
+		durationMillis(requestStart, at),
+		durationMillis(attempt.requestStartedAt, at),
+		err.Error(),
+	)
 }
 
 func writeHeaders(builder *strings.Builder, headers http.Header) {
