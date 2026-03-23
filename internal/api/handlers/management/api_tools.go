@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -649,13 +650,7 @@ func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 		}
 	}
 
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok || transport == nil {
-		return &http.Transport{Proxy: nil}
-	}
-	clone := transport.Clone()
-	clone.Proxy = nil
-	return clone
+	return buildDirectTransportForAuth(auth)
 }
 
 func buildProxyTransport(proxyStr string) *http.Transport {
@@ -665,4 +660,23 @@ func buildProxyTransport(proxyStr string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+func buildDirectTransportForAuth(auth *coreauth.Auth) *http.Transport {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || transport == nil {
+		return &http.Transport{Proxy: nil}
+	}
+
+	clone := transport.Clone()
+	clone.Proxy = nil
+
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		dialer := &net.Dialer{}
+		clone.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp4", addr)
+		}
+	}
+
+	return clone
 }

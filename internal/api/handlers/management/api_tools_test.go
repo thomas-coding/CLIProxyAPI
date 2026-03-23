@@ -56,3 +56,21 @@ func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
 		t.Fatalf("proxy URL = %v, want http://global-proxy.example.com:8080", proxyURL)
 	}
 }
+
+func TestAPICallTransportCodexWithoutProxyForcesIPv4DirectTransport(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{}
+
+	transport := h.apiCallTransport(&coreauth.Auth{Provider: "codex"})
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected codex direct transport to disable proxy function")
+	}
+	if httpTransport.DialContext == nil {
+		t.Fatal("expected codex direct transport to override DialContext for IPv4")
+	}
+}
