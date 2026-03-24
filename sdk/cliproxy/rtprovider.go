@@ -1,8 +1,6 @@
 package cliproxy
 
 import (
-	"context"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -70,10 +68,5 @@ func shouldForceCodexIPv4(auth *coreauth.Auth, proxyStr string) bool {
 }
 
 func newIPv4DirectTransport() http.RoundTripper {
-	transport := proxyutil.NewDirectTransport()
-	dialer := &net.Dialer{}
-	transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
-		return dialer.DialContext(ctx, "tcp4", addr)
-	}
-	return transport
+	return proxyutil.NewIPv4DirectTransport()
 }

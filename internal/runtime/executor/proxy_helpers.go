@@ -56,6 +56,8 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
 		httpClient.Transport = rt
+	} else if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		httpClient.Transport = proxyutil.NewIPv4DirectTransport()
 	}
 
 	return httpClient

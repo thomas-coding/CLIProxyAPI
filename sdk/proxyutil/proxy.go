@@ -78,6 +78,16 @@ func NewDirectTransport() *http.Transport {
 	return &http.Transport{Proxy: nil}
 }
 
+// NewIPv4DirectTransport returns a direct transport that forces IPv4 TCP dials.
+func NewIPv4DirectTransport() *http.Transport {
+	transport := NewDirectTransport()
+	dialer := &net.Dialer{}
+	transport.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", addr)
+	}
+	return transport
+}
+
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
 func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 	setting, errParse := Parse(raw)

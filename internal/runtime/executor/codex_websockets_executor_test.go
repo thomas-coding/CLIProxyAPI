@@ -200,4 +200,16 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
 	}
+	if dialer.NetDialContext == nil {
+		t.Fatal("expected websocket dialer to keep an IPv4 NetDialContext")
+	}
+}
+
+func TestNewProxyAwareWebsocketDialerWithoutProxyPrefersIPv4(t *testing.T) {
+	t.Parallel()
+
+	dialer := newProxyAwareWebsocketDialer(&config.Config{}, &cliproxyauth.Auth{Provider: "codex"})
+	if dialer.NetDialContext == nil {
+		t.Fatal("expected websocket dialer without proxy to override NetDialContext for IPv4")
+	}
 }

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -38,8 +38,30 @@ type CodexAuth struct {
 // It initializes an HTTP client with proxy settings from the provided configuration.
 func NewCodexAuth(cfg *config.Config) *CodexAuth {
 	return &CodexAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+		httpClient: NewOpenAIHTTPClient(cfg),
 	}
+}
+
+// NewOpenAIHTTPClient builds an HTTP client for OpenAI-family Codex endpoints.
+// When no explicit proxy is configured, direct traffic is forced over IPv4.
+func NewOpenAIHTTPClient(cfg *config.Config) *http.Client {
+	return &http.Client{Transport: buildOpenAITransport(cfg)}
+}
+
+func buildOpenAITransport(cfg *config.Config) http.RoundTripper {
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	transport, mode, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		log.Errorf("%v", errBuild)
+	}
+	if mode == proxyutil.ModeProxy && transport != nil {
+		return transport
+	}
+	return proxyutil.NewIPv4DirectTransport()
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).

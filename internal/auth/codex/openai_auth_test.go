@@ -7,6 +7,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -40,5 +43,46 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("expected 1 refresh attempt, got %d", got)
+	}
+}
+
+func TestNewOpenAIHTTPClientWithoutProxyForcesIPv4DirectTransport(t *testing.T) {
+	t.Parallel()
+
+	client := NewOpenAIHTTPClient(&config.Config{})
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("expected OpenAI client without proxy to bypass proxy function")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("expected OpenAI client without proxy to override DialContext for IPv4")
+	}
+}
+
+func TestNewOpenAIHTTPClientWithProxyUsesProxyTransport(t *testing.T) {
+	t.Parallel()
+
+	client := NewOpenAIHTTPClient(&config.Config{
+		SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://proxy.example.com:8080"},
+	})
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "https://auth.openai.com/oauth/token", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest returned error: %v", err)
+	}
+
+	proxyURL, errProxy := transport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("transport.Proxy returned error: %v", errProxy)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://proxy.example.com:8080" {
+		t.Fatalf("proxy URL = %v, want http://proxy.example.com:8080", proxyURL)
 	}
 }
