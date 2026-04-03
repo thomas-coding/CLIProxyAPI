@@ -42,4 +42,9 @@ type StreamingConfig struct {
 	// to allow auth rotation / transient recovery.
 	// <= 0 disables bootstrap retries. Default is 0.
 	BootstrapRetries int `yaml:"bootstrap-retries,omitempty" json:"bootstrap-retries,omitempty"`
+
+	// BootstrapBufferMillis delays the first downstream flush by a small window so early upstream
+	// failures can still retry transparently before the client sees partial output.
+	// <= 0 disables buffering. Default is 0.
+	BootstrapBufferMillis int `yaml:"bootstrap-buffer-millis,omitempty" json:"bootstrap-buffer-millis,omitempty"`
 }

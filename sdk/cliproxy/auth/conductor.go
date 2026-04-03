@@ -65,6 +65,13 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	streamInterruptedCode = "stream_interrupted"
+
+	streamInterruptedBaseCooldown   = 10 * time.Minute
+	streamInterruptedRetryCooldown  = 1 * time.Hour
+	streamInterruptedMaxCooldown    = 6 * time.Hour
+	streamInterruptedRetryWindow    = 30 * time.Minute
+	streamInterruptedEscalateWindow = 6 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -492,11 +499,15 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
 				failed = true
-				rerr := &Error{Message: chunk.Err.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
-					rerr.HTTPStatus = se.StatusCode()
+				if ctx == nil || ctx.Err() == nil {
+					m.MarkResult(ctx, Result{
+						AuthID:   auth.ID,
+						Provider: provider,
+						Model:    routeModel,
+						Success:  false,
+						Error:    resultErrorFromExecutionError(chunk.Err),
+					})
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -1616,6 +1627,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
+				previousLastError := cloneError(state.LastError)
+				previousUpdatedAt := state.UpdatedAt
+				previousNextRetryAfter := state.NextRetryAfter
 				state.Unavailable = true
 				state.Status = StatusError
 				state.UpdatedAt = now
@@ -1626,54 +1640,63 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					auth.StatusMessage = result.Error.Message
 				}
 
-				statusCode := statusCodeFromResult(result.Error)
-				switch statusCode {
-				case 401:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "unauthorized"
-					shouldSuspendModel = true
-				case 402, 403:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "payment_required"
-					shouldSuspendModel = true
-				case 404:
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "not_found"
-					shouldSuspendModel = true
-				case 429:
-					var next time.Time
-					backoffLevel := state.Quota.BackoffLevel
-					if result.RetryAfter != nil {
-						next = now.Add(*result.RetryAfter)
-					} else {
-						cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-						if cooldown > 0 {
-							next = now.Add(cooldown)
-						}
-						backoffLevel = nextLevel
-					}
-					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
-					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
-				case 408, 500, 502, 503, 504:
-					if quotaCooldownDisabledForAuth(auth) {
-						state.NextRetryAfter = time.Time{}
-					} else {
-						next := now.Add(1 * time.Minute)
+				if isStreamInterruptedError(result.Error) {
+					next := now.Add(nextStreamInterruptedCooldown(previousLastError, previousUpdatedAt, previousNextRetryAfter, now))
+					if next.After(state.NextRetryAfter) {
 						state.NextRetryAfter = next
 					}
-				default:
-					state.NextRetryAfter = time.Time{}
+					suspendReason = streamInterruptedCode
+					shouldSuspendModel = true
+				} else {
+					statusCode := statusCodeFromResult(result.Error)
+					switch statusCode {
+					case 401:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "unauthorized"
+						shouldSuspendModel = true
+					case 402, 403:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "payment_required"
+						shouldSuspendModel = true
+					case 404:
+						next := now.Add(12 * time.Hour)
+						state.NextRetryAfter = next
+						suspendReason = "not_found"
+						shouldSuspendModel = true
+					case 429:
+						var next time.Time
+						backoffLevel := state.Quota.BackoffLevel
+						if result.RetryAfter != nil {
+							next = now.Add(*result.RetryAfter)
+						} else {
+							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+							if cooldown > 0 {
+								next = now.Add(cooldown)
+							}
+							backoffLevel = nextLevel
+						}
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
+					case 408, 500, 502, 503, 504:
+						if quotaCooldownDisabledForAuth(auth) {
+							state.NextRetryAfter = time.Time{}
+						} else {
+							next := now.Add(1 * time.Minute)
+							state.NextRetryAfter = next
+						}
+					default:
+						state.NextRetryAfter = time.Time{}
+					}
 				}
 
 				auth.Status = StatusError
@@ -1876,11 +1899,81 @@ func retryAfterFromError(err error) *time.Duration {
 	return new(*retryAfter)
 }
 
+func resultErrorFromExecutionError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	resultErr := &Error{
+		Message:    err.Error(),
+		HTTPStatus: statusCodeFromError(err),
+	}
+	if isStreamInterruptedError(resultErr) {
+		resultErr.Code = streamInterruptedCode
+		resultErr.Retryable = true
+		if resultErr.HTTPStatus == 0 {
+			resultErr.HTTPStatus = http.StatusRequestTimeout
+		}
+	}
+	return resultErr
+}
+
 func statusCodeFromResult(err *Error) int {
 	if err == nil {
 		return 0
 	}
 	return err.StatusCode()
+}
+
+func isStreamInterruptedError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(err.Code), streamInterruptedCode) {
+		return true
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Message))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "stream disconnected before completion") ||
+		strings.Contains(msg, "stream closed before response.completed") ||
+		strings.Contains(msg, "stream incomplete") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") {
+		return true
+	}
+	return err.HTTPStatus == http.StatusRequestTimeout &&
+		(strings.Contains(msg, "stream") ||
+			strings.Contains(msg, "eof") ||
+			strings.Contains(msg, "connection") ||
+			strings.Contains(msg, "context canceled"))
+}
+
+func nextStreamInterruptedCooldown(lastErr *Error, updatedAt, nextRetryAfter, now time.Time) time.Duration {
+	if !isStreamInterruptedError(lastErr) {
+		return streamInterruptedBaseCooldown
+	}
+
+	previousCooldown := time.Duration(0)
+	if !updatedAt.IsZero() && nextRetryAfter.After(updatedAt) {
+		previousCooldown = nextRetryAfter.Sub(updatedAt)
+	} else if nextRetryAfter.After(now) {
+		previousCooldown = nextRetryAfter.Sub(now)
+	}
+
+	if previousCooldown >= streamInterruptedRetryCooldown {
+		if updatedAt.IsZero() || now.Sub(updatedAt) <= streamInterruptedEscalateWindow {
+			return streamInterruptedMaxCooldown
+		}
+	}
+	if previousCooldown >= streamInterruptedBaseCooldown {
+		if updatedAt.IsZero() || now.Sub(updatedAt) <= streamInterruptedRetryWindow {
+			return streamInterruptedRetryCooldown
+		}
+	}
+	return streamInterruptedBaseCooldown
 }
 
 // isRequestInvalidError returns true if the error represents a client request

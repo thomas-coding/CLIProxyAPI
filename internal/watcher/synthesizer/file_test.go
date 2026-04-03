@@ -121,6 +121,56 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 }
 
+func TestSynthesizeAuthFile_RestoresPersistedRuntimeState(t *testing.T) {
+	tempDir := t.TempDir()
+	now := time.Now()
+
+	metadata := coreauth.MetadataForPersistence(&coreauth.Auth{
+		Metadata:       map[string]any{"type": "codex", "email": "cooling@example.com"},
+		Unavailable:    true,
+		NextRetryAfter: now.Add(20 * time.Minute),
+		Quota: coreauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: now.Add(25 * time.Minute),
+		},
+	})
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+
+	auths := SynthesizeAuthFile(&SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         now,
+		IDGenerator: NewStableIDGenerator(),
+	}, filepath.Join(tempDir, "codex-auth.json"), data)
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	auth := auths[0]
+	if auth == nil {
+		t.Fatal("expected auth entry")
+	}
+	if !auth.Unavailable {
+		t.Fatal("expected synthesized auth to remain unavailable")
+	}
+	if !auth.NextRetryAfter.After(now) {
+		t.Fatalf("expected future retry time, got %v", auth.NextRetryAfter)
+	}
+	if !auth.Quota.Exceeded {
+		t.Fatal("expected quota exceeded state to be restored")
+	}
+	if auth.Status != coreauth.StatusError {
+		t.Fatalf("status = %q, want %q", auth.Status, coreauth.StatusError)
+	}
+	if _, ok := auth.Metadata["_cliproxy_runtime"]; ok {
+		t.Fatal("expected runtime metadata to be removed after restore")
+	}
+}
+
 func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	tempDir := t.TempDir()
 

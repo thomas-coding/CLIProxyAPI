@@ -243,13 +243,21 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+	persistedMetadata := cliproxyauth.MetadataForPersistence(auth)
+
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(persistedMetadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
-	case auth.Metadata != nil:
-		raw, errMarshal := json.Marshal(auth.Metadata)
+	case persistedMetadata != nil:
+		raw, errMarshal := json.Marshal(persistedMetadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
@@ -446,6 +454,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
+	cliproxyauth.RestoreRuntimeState(auth)
 	return auth, nil
 }
 

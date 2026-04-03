@@ -1211,6 +1211,56 @@ func TestRefreshAuthStateDispatchesRuntimeAuths(t *testing.T) {
 	}
 }
 
+func TestReloadClients_RestoresRuntimeStateFromAuthFiles(t *testing.T) {
+	authDir := t.TempDir()
+	now := time.Now()
+	metadata := coreauth.MetadataForPersistence(&coreauth.Auth{
+		Metadata:       map[string]any{"type": "codex", "email": "cooling@example.com"},
+		Unavailable:    true,
+		NextRetryAfter: now.Add(15 * time.Minute),
+		Quota: coreauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: now.Add(20 * time.Minute),
+		},
+	})
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	authFile := filepath.Join(authDir, "cooling.json")
+	if err = os.WriteFile(authFile, data, 0o644); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	w := &Watcher{
+		authDir:        authDir,
+		lastAuthHashes: make(map[string]string),
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	w.reloadClients(true, nil, false)
+
+	w.clientsMutex.RLock()
+	auth := w.currentAuths["cooling.json"]
+	w.clientsMutex.RUnlock()
+	if auth == nil {
+		t.Fatal("expected synthesized auth in currentAuths")
+	}
+	if !auth.Unavailable {
+		t.Fatal("expected restored auth to remain unavailable")
+	}
+	if !auth.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("expected future retry time, got %v", auth.NextRetryAfter)
+	}
+	if !auth.Quota.Exceeded {
+		t.Fatal("expected quota exceeded state to be restored")
+	}
+	if auth.Status != coreauth.StatusError {
+		t.Fatalf("status = %q, want %q", auth.Status, coreauth.StatusError)
+	}
+}
+
 func TestAddOrUpdateClientEdgeCases(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := tmpDir

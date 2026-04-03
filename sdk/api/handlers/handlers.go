@@ -50,6 +50,8 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	defaultStreamingBootstrapBuffer  = 0
+	maxStreamingBootstrapBufferBytes = 64 * 1024
 )
 
 type pinnedAuthContextKey struct{}
@@ -177,6 +179,19 @@ func StreamingBootstrapRetries(cfg *config.SDKConfig) int {
 		retries = 0
 	}
 	return retries
+}
+
+// StreamingBootstrapBufferDuration returns how long the server may delay the first downstream
+// flush so an upstream can still transparently retry on very early failures.
+func StreamingBootstrapBufferDuration(cfg *config.SDKConfig) time.Duration {
+	millis := defaultStreamingBootstrapBuffer
+	if cfg != nil {
+		millis = cfg.Streaming.BootstrapBufferMillis
+	}
+	if millis <= 0 {
+		return 0
+	}
+	return time.Duration(millis) * time.Millisecond
 }
 
 // PassthroughHeadersEnabled returns whether upstream response headers should be forwarded to clients.
@@ -623,6 +638,52 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		sentPayload := false
 		bootstrapRetries := 0
 		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+		bootstrapBuffer := StreamingBootstrapBufferDuration(h.Cfg)
+		var (
+			pendingPayloads [][]byte
+			pendingBytes    int
+			bufferTimer     *time.Timer
+			bufferTimerC    <-chan time.Time
+			sendData        func([]byte) bool
+		)
+
+		stopBufferTimer := func() {
+			if bufferTimer == nil {
+				bufferTimerC = nil
+				return
+			}
+			if !bufferTimer.Stop() {
+				select {
+				case <-bufferTimer.C:
+				default:
+				}
+			}
+			bufferTimer = nil
+			bufferTimerC = nil
+		}
+
+		flushPending := func() bool {
+			if len(pendingPayloads) == 0 {
+				stopBufferTimer()
+				return true
+			}
+			stopBufferTimer()
+			for i := range pendingPayloads {
+				sentPayload = true
+				if okSendData := sendData(pendingPayloads[i]); !okSendData {
+					return false
+				}
+			}
+			pendingPayloads = nil
+			pendingBytes = 0
+			return true
+		}
+
+		resetPending := func() {
+			pendingPayloads = nil
+			pendingBytes = 0
+			stopBufferTimer()
+		}
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -637,7 +698,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			}
 		}
 
-		sendData := func(chunk []byte) bool {
+		sendData = func(chunk []byte) bool {
 			if ctx == nil {
 				dataChan <- chunk
 				return true
@@ -669,16 +730,30 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 			for {
 				var chunk coreexecutor.StreamChunk
 				var ok bool
+				var ctxDone <-chan struct{}
 				if ctx != nil {
+					ctxDone = ctx.Done()
+				}
+				if ctxDone != nil || bufferTimerC != nil {
 					select {
-					case <-ctx.Done():
+					case <-ctxDone:
 						return
+					case <-bufferTimerC:
+						if !flushPending() {
+							return
+						}
+						continue
 					case chunk, ok = <-chunks:
 					}
 				} else {
 					chunk, ok = <-chunks
 				}
 				if !ok {
+					if !sentPayload {
+						if okFlush := flushPending(); !okFlush {
+							return
+						}
+					}
 					return
 				}
 				if chunk.Err != nil {
@@ -686,6 +761,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload {
+						resetPending()
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
@@ -721,6 +797,20 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
 							return
 						}
+					}
+					if !sentPayload && bootstrapBuffer > 0 {
+						if bufferTimer == nil {
+							bufferTimer = time.NewTimer(bootstrapBuffer)
+							bufferTimerC = bufferTimer.C
+						}
+						pendingPayloads = append(pendingPayloads, cloneBytes(chunk.Payload))
+						pendingBytes += len(chunk.Payload)
+						if pendingBytes >= maxStreamingBootstrapBufferBytes {
+							if okFlush := flushPending(); !okFlush {
+								return
+							}
+						}
+						continue
 					}
 					sentPayload = true
 					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {

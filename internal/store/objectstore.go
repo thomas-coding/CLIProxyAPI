@@ -182,13 +182,21 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 		return "", fmt.Errorf("object store: create auth directory: %w", err)
 	}
 
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+	persistedMetadata := cliproxyauth.MetadataForPersistence(auth)
+
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(persistedMetadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
-	case auth.Metadata != nil:
-		raw, errMarshal := json.Marshal(auth.Metadata)
+	case persistedMetadata != nil:
+		raw, errMarshal := json.Marshal(persistedMetadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("object store: marshal metadata: %w", errMarshal)
 		}
@@ -595,6 +603,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	cliproxyauth.RestoreRuntimeState(auth)
 	return auth, nil
 }
 

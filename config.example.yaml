@@ -107,6 +107,7 @@ nonstream-keepalive-interval: 0
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
+#   bootstrap-buffer-millis: 500 # Default: 0 (disabled). Delay first downstream flush briefly.
 
 # Gemini API keys
 # gemini-api-key:

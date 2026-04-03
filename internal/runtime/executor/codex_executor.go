@@ -372,6 +372,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		sawCompleted := false
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
@@ -379,6 +380,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			if bytes.HasPrefix(line, dataTag) {
 				data := bytes.TrimSpace(line[5:])
 				if gjson.GetBytes(data, "type").String() == "response.completed" {
+					sawCompleted = true
 					if detail, ok := parseCodexUsage(data); ok {
 						reporter.publish(ctx, detail)
 					}
@@ -394,6 +396,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			recordAPIResponseError(ctx, e.cfg, errScan)
 			reporter.publishFailure(ctx)
 			out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			return
+		}
+		if !sawCompleted {
+			errIncomplete := statusErr{code: http.StatusRequestTimeout, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
+			recordAPIResponseError(ctx, e.cfg, errIncomplete)
+			reporter.publishFailure(ctx)
+			out <- cliproxyexecutor.StreamChunk{Err: errIncomplete}
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil

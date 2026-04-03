@@ -687,7 +687,6 @@ func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
 	}
 	return nil
 }
-
 func (h *Handler) authIDForPath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {

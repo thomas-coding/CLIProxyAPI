@@ -1,6 +1,13 @@
 package auth
 
-import "testing"
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+)
 
 func TestExtractAccessToken(t *testing.T) {
 	t.Parallel()
@@ -76,5 +83,59 @@ func TestExtractAccessToken(t *testing.T) {
 				t.Errorf("extractAccessToken() = %q, want %q", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestFileTokenStore_SaveAndListRestoresRuntimeState(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	auth := &cliproxyauth.Auth{
+		ID:       "codex-auth.json",
+		FileName: "codex-auth.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "cooling@example.com",
+		},
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(20 * time.Minute),
+		Quota: cliproxyauth.QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: time.Now().Add(25 * time.Minute),
+		},
+	}
+
+	if _, err := store.Save(context.Background(), auth); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	entries, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+
+	got := entries[0]
+	if got == nil {
+		t.Fatalf("expected auth entry")
+	}
+	if !got.Unavailable {
+		t.Fatalf("expected restored auth to remain unavailable")
+	}
+	if !got.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("expected future retry time, got %v", got.NextRetryAfter)
+	}
+	if !got.Quota.Exceeded {
+		t.Fatalf("expected restored quota exceeded state")
+	}
+	if got.Attributes["path"] != filepath.Join(dir, "codex-auth.json") {
+		t.Fatalf("path = %q, want %q", got.Attributes["path"], filepath.Join(dir, "codex-auth.json"))
 	}
 }
