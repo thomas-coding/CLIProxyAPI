@@ -11,6 +11,8 @@ import (
 const RequestedModelMetadataKey = "requested_model"
 
 const (
+	// AffinityKeyMetadataKey carries a downstream user-affinity key for lease-based routing.
+	AffinityKeyMetadataKey = "affinity_key"
 	// PinnedAuthMetadataKey locks execution to a specific auth ID.
 	PinnedAuthMetadataKey = "pinned_auth_id"
 	// SelectedAuthMetadataKey stores the auth ID selected by the scheduler.

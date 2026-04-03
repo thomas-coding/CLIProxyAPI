@@ -98,6 +98,10 @@ type Result struct {
 	Provider string
 	// Model is the upstream model identifier used for the request.
 	Model string
+	// AffinityKey is the normalized provider+user lease key for this request, when present.
+	AffinityKey string
+	// AffinityGeneration identifies the reserved lease generation for this request, when present.
+	AffinityGeneration uint64
 	// Success marks whether the execution succeeded.
 	Success bool
 	// RetryAfter carries a provider supplied retry hint (e.g. 429 retryDelay).
@@ -142,6 +146,7 @@ type Manager struct {
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
+	affinity  *affinityManager
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -189,6 +194,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		affinity:         newAffinityManager(),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -279,8 +285,38 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
+	prev, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if m.affinity != nil && affinityConfigChanged(prev, cfg) {
+		m.affinity.reset()
+	}
 	m.runtimeConfig.Store(cfg)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+}
+
+func affinityConfigChanged(prev, next *internalconfig.Config) bool {
+	prevAffinity := internalconfig.AffinityConfig{}
+	nextAffinity := internalconfig.AffinityConfig{}
+	if prev != nil {
+		prevAffinity = prev.Affinity
+	}
+	if next != nil {
+		nextAffinity = next.Affinity
+	}
+	if prevAffinity.Enabled != nextAffinity.Enabled ||
+		prevAffinity.ShadowMode != nextAffinity.ShadowMode ||
+		prevAffinity.IdleTTLSeconds != nextAffinity.IdleTTLSeconds ||
+		prevAffinity.TransientBreakStrikes != nextAffinity.TransientBreakStrikes {
+		return true
+	}
+	if len(prevAffinity.TrustedClientKeys) != len(nextAffinity.TrustedClientKeys) {
+		return true
+	}
+	for i := range prevAffinity.TrustedClientKeys {
+		if strings.TrimSpace(prevAffinity.TrustedClientKeys[i]) != strings.TrimSpace(nextAffinity.TrustedClientKeys[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -490,7 +526,7 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 	}
 }
 
-func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, routeModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, routeModel, affinityKey string, affinityGeneration uint64, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
@@ -501,11 +537,13 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 				failed = true
 				if ctx == nil || ctx.Err() == nil {
 					m.MarkResult(ctx, Result{
-						AuthID:   auth.ID,
-						Provider: provider,
-						Model:    routeModel,
-						Success:  false,
-						Error:    resultErrorFromExecutionError(chunk.Err),
+						AuthID:             auth.ID,
+						Provider:           provider,
+						Model:              routeModel,
+						AffinityKey:        affinityKey,
+						AffinityGeneration: affinityGeneration,
+						Success:            false,
+						Error:              resultErrorFromExecutionError(chunk.Err),
 					})
 				}
 			}
@@ -518,6 +556,17 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 			}
 			select {
 			case <-ctx.Done():
+				if m.affinity != nil {
+					m.affinity.observeResult(m.currentConfig(), Result{
+						AuthID:             auth.ID,
+						Provider:           provider,
+						Model:              routeModel,
+						AffinityKey:        affinityKey,
+						AffinityGeneration: affinityGeneration,
+						Success:            false,
+						Error:              &Error{Message: ctx.Err().Error()},
+					})
+				}
 				forward = false
 				return false
 			case out <- chunk:
@@ -537,16 +586,18 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: routeModel, AffinityKey: affinityKey, AffinityGeneration: affinityGeneration, Success: true})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
-func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string) (*cliproxyexecutor.StreamResult, error) {
+func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, affinityKey string) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	cfg := m.currentConfig()
+	affinityGeneration := affinityGenerationFromMetadata(opts.Metadata)
 	execModels := m.prepareExecutionModels(auth, routeModel)
 	var lastErr error
 	for idx, execModel := range execModels {
@@ -555,13 +606,24 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				if m.affinity != nil {
+					m.affinity.observeResult(cfg, Result{
+						AuthID:             auth.ID,
+						Provider:           provider,
+						Model:              routeModel,
+						AffinityKey:        affinityKey,
+						AffinityGeneration: affinityGeneration,
+						Success:            false,
+						Error:              &Error{Message: errCtx.Error()},
+					})
+				}
 				return nil, errCtx
 			}
 			rerr := &Error{Message: errStream.Error()}
 			if se, ok := errors.AsType[cliproxyexecutor.StatusError](errStream); ok && se != nil {
 				rerr.HTTPStatus = se.StatusCode()
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, AffinityKey: affinityKey, AffinityGeneration: affinityGeneration, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
@@ -574,6 +636,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		buffered, closed, bootstrapErr := readStreamBootstrap(ctx, streamResult.Chunks)
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				if m.affinity != nil {
+					m.affinity.observeResult(cfg, Result{
+						AuthID:             auth.ID,
+						Provider:           provider,
+						Model:              routeModel,
+						AffinityKey:        affinityKey,
+						AffinityGeneration: affinityGeneration,
+						Success:            false,
+						Error:              &Error{Message: errCtx.Error()},
+					})
+				}
 				discardStreamChunks(streamResult.Chunks)
 				return nil, errCtx
 			}
@@ -582,7 +655,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, AffinityKey: affinityKey, AffinityGeneration: affinityGeneration, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -593,7 +666,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](bootstrapErr); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, AffinityKey: affinityKey, AffinityGeneration: affinityGeneration, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
@@ -603,12 +676,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: bootstrapErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, affinityKey, affinityGeneration, streamResult.Headers, nil, errCh), nil
 		}
 
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: emptyErr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, AffinityKey: affinityKey, AffinityGeneration: affinityGeneration, Success: false, Error: emptyErr}
 			m.MarkResult(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
@@ -617,7 +690,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: emptyErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, affinityKey, affinityGeneration, streamResult.Headers, nil, errCh), nil
 		}
 
 		remaining := streamResult.Chunks
@@ -626,7 +699,17 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
+		if m.affinity != nil {
+			m.affinity.observeResult(cfg, Result{
+				AuthID:             auth.ID,
+				Provider:           provider,
+				Model:              routeModel,
+				AffinityKey:        affinityKey,
+				AffinityGeneration: affinityGeneration,
+				Success:            true,
+			})
+		}
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, affinityKey, affinityGeneration, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
@@ -824,6 +907,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	m.reconcileAffinityAuthState(authClone)
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -852,6 +936,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	m.reconcileAffinityAuthState(authClone)
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -886,6 +971,9 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	m.rebuildAPIKeyModelAliasLocked(cfg)
 	m.mu.Unlock()
+	if m.affinity != nil {
+		m.affinity.reset()
+	}
 	m.syncScheduler()
 	return nil
 }
@@ -989,26 +1077,76 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	cfg := m.currentConfig()
+	affinityKey := m.affinityScopeKey(providers, opts)
+	pickOpts, affinityPinned := m.affinity.preparePickOptions(cfg, affinityKey, opts)
+	enforceAffinityOwnership := affinitySelectionEnabled(cfg) && affinityKey != ""
 	tried := make(map[string]struct{})
+	selectionSkipped := make(map[string]struct{})
 	var lastErr error
 	for {
+		if enforceAffinityOwnership && m.releaseIncompatibleAffinityLease(cfg, providers, routeModel, affinityKey) {
+			pickOpts = opts
+			affinityPinned = false
+			clear(selectionSkipped)
+		}
 		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, mergeTriedSets(tried, selectionSkipped))
 		if errPick != nil {
+			if affinityPinned {
+				pickOpts = opts
+				affinityPinned = false
+				clear(selectionSkipped)
+				continue
+			}
+			// Acquire fallback: if exclusive affinity cannot find any free auth,
+			// relax back to the normal shared selector instead of surfacing a hard failure.
+			if enforceAffinityOwnership {
+				enforceAffinityOwnership = false
+				clear(selectionSkipped)
+				continue
+			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		if enforceAffinityOwnership && !m.affinity.canUseAuth(cfg, affinityKey, auth.ID) {
+			selectionSkipped[auth.ID] = struct{}{}
+			if affinityPinned {
+				pickOpts = opts
+				affinityPinned = false
+			}
+			continue
+		}
+		execOpts := opts
+		if enforceAffinityOwnership {
+			claimedOpts, claimedAuthID, claimed := m.affinity.claimSelection(cfg, affinityKey, auth.ID, opts)
+			if !claimed {
+				if claimedAuthID != "" && claimedAuthID != auth.ID {
+					pickOpts = claimedOpts
+					affinityPinned = true
+					clear(selectionSkipped)
+					continue
+				}
+				selectionSkipped[auth.ID] = struct{}{}
+				if affinityPinned {
+					pickOpts = opts
+					affinityPinned = false
+				}
+				continue
+			}
+			execOpts = claimedOpts
+		}
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		publishSelectedAuthMetadata(execOpts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1022,10 +1160,28 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		for _, upstreamModel := range models {
 			execReq := req
 			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			result := Result{
+				AuthID:             auth.ID,
+				Provider:           provider,
+				Model:              routeModel,
+				AffinityKey:        affinityKey,
+				AffinityGeneration: affinityGenerationFromMetadata(execOpts.Metadata),
+				Success:            errExec == nil,
+			}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					if m.affinity != nil {
+						m.affinity.observeResult(cfg, Result{
+							AuthID:             auth.ID,
+							Provider:           provider,
+							Model:              routeModel,
+							AffinityKey:        affinityKey,
+							AffinityGeneration: affinityGenerationFromMetadata(execOpts.Metadata),
+							Success:            false,
+							Error:              &Error{Message: errCtx.Error()},
+						})
+					}
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1061,7 +1217,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	cfg := m.currentConfig()
+	affinityKey := m.affinityScopeKey(providers, opts)
+	pickOpts, affinityPinned := m.affinity.preparePickOptions(cfg, affinityKey, opts)
+	enforceAffinityOwnership := affinitySelectionEnabled(cfg) && affinityKey != ""
 	tried := make(map[string]struct{})
+	selectionSkipped := make(map[string]struct{})
 	var lastErr error
 	for {
 		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
@@ -1070,14 +1231,32 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, mergeTriedSets(tried, selectionSkipped))
 		if errPick != nil {
+			if affinityPinned {
+				pickOpts = opts
+				affinityPinned = false
+				clear(selectionSkipped)
+				continue
+			}
+			if enforceAffinityOwnership {
+				enforceAffinityOwnership = false
+				clear(selectionSkipped)
+				continue
+			}
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
-
+		if enforceAffinityOwnership && !m.affinity.canUseAuth(cfg, affinityKey, auth.ID) {
+			selectionSkipped[auth.ID] = struct{}{}
+			if affinityPinned {
+				pickOpts = opts
+				affinityPinned = false
+			}
+			continue
+		}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
@@ -1095,7 +1274,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, AffinityKey: affinityKey, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
 					return cliproxyexecutor.Response{}, errCtx
@@ -1107,14 +1286,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.hook.OnResult(execCtx, result)
+				m.observeCountResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
-			m.hook.OnResult(execCtx, result)
+			m.observeCountResult(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1127,32 +1306,140 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 }
 
+func (m *Manager) observeCountResult(ctx context.Context, result Result) {
+	if m == nil {
+		return
+	}
+	m.hook.OnResult(ctx, result)
+}
+
+func (m *Manager) releaseIncompatibleAffinityLease(cfg *internalconfig.Config, providers []string, model, scopeKey string) bool {
+	if m == nil || m.affinity == nil || !affinitySelectionEnabled(cfg) || scopeKey == "" {
+		return false
+	}
+	authID := m.affinity.currentLeaseAuthID(cfg, scopeKey)
+	if authID == "" {
+		return false
+	}
+
+	m.mu.RLock()
+	auth := m.auths[authID]
+	var authSnapshot *Auth
+	if auth != nil {
+		authSnapshot = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if authSnapshot == nil {
+		return m.affinity.releaseLease(scopeKey, authID)
+	}
+
+	providerKey := strings.ToLower(strings.TrimSpace(authSnapshot.Provider))
+	if providerKey == "" || !containsProvider(normalizeProviderKeys(providers), providerKey) {
+		return m.affinity.releaseLease(scopeKey, authID)
+	}
+
+	modelKey := canonicalModelKey(model)
+	if modelKey != "" {
+		registryRef := registry.GetGlobalRegistry()
+		if registryRef != nil && !registryRef.ClientSupportsModel(authID, modelKey) {
+			return m.affinity.releaseLease(scopeKey, authID)
+		}
+	}
+
+	if blocked, _, _ := isAuthBlockedForModel(authSnapshot, model, time.Now()); blocked {
+		return m.affinity.releaseLease(scopeKey, authID)
+	}
+	return false
+}
+
+func (m *Manager) reconcileAffinityAuthState(auth *Auth) {
+	if m == nil || m.affinity == nil || auth == nil {
+		return
+	}
+	now := time.Now()
+	if auth.Disabled || auth.Status == StatusDisabled {
+		m.affinity.releaseAuth(auth.ID)
+		return
+	}
+	if blocked, _ := authWide401BlockState(auth, now); blocked {
+		m.affinity.releaseAuth(auth.ID)
+	}
+}
+
 func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int) (*cliproxyexecutor.StreamResult, error) {
 	if len(providers) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
+	cfg := m.currentConfig()
+	affinityKey := m.affinityScopeKey(providers, opts)
+	pickOpts, affinityPinned := m.affinity.preparePickOptions(cfg, affinityKey, opts)
+	enforceAffinityOwnership := affinitySelectionEnabled(cfg) && affinityKey != ""
 	tried := make(map[string]struct{})
+	selectionSkipped := make(map[string]struct{})
 	var lastErr error
 	for {
+		if enforceAffinityOwnership && m.releaseIncompatibleAffinityLease(cfg, providers, routeModel, affinityKey) {
+			pickOpts = opts
+			affinityPinned = false
+			clear(selectionSkipped)
+		}
 		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, pickOpts, mergeTriedSets(tried, selectionSkipped))
 		if errPick != nil {
+			if affinityPinned {
+				pickOpts = opts
+				affinityPinned = false
+				clear(selectionSkipped)
+				continue
+			}
+			if enforceAffinityOwnership {
+				enforceAffinityOwnership = false
+				clear(selectionSkipped)
+				continue
+			}
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, errPick
 		}
+		if enforceAffinityOwnership && !m.affinity.canUseAuth(cfg, affinityKey, auth.ID) {
+			selectionSkipped[auth.ID] = struct{}{}
+			if affinityPinned {
+				pickOpts = opts
+				affinityPinned = false
+			}
+			continue
+		}
+		execOpts := opts
+		if enforceAffinityOwnership {
+			claimedOpts, claimedAuthID, claimed := m.affinity.claimSelection(cfg, affinityKey, auth.ID, opts)
+			if !claimed {
+				if claimedAuthID != "" && claimedAuthID != auth.ID {
+					pickOpts = claimedOpts
+					affinityPinned = true
+					clear(selectionSkipped)
+					continue
+				}
+				selectionSkipped[auth.ID] = struct{}{}
+				if affinityPinned {
+					pickOpts = opts
+					affinityPinned = false
+				}
+				continue
+			}
+			execOpts = claimedOpts
+		}
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
-		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
+		publishSelectedAuthMetadata(execOpts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
@@ -1160,7 +1447,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel)
+		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, execOpts, routeModel, affinityKey)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
@@ -1607,6 +1894,26 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		if result.Success {
+			if m.affinity != nil && !m.affinity.acceptsSuccess(m.currentConfig(), result) {
+				authSnapshot = auth.Clone()
+				m.mu.Unlock()
+				if m.scheduler != nil && authSnapshot != nil {
+					m.scheduler.upsertAuth(authSnapshot)
+				}
+				m.hook.OnResult(ctx, result)
+				return
+			}
+			if blocked, _ := authWide401BlockState(auth, now); auth.Disabled || auth.Status == StatusDisabled || blocked {
+				authSnapshot = auth.Clone()
+				m.mu.Unlock()
+				if m.scheduler != nil && authSnapshot != nil {
+					m.scheduler.upsertAuth(authSnapshot)
+				}
+				m.hook.OnResult(ctx, result)
+				return
+			}
+		}
 
 		if result.Success {
 			if result.Model != "" {
@@ -1729,6 +2036,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	}
+	if m.affinity != nil {
+		m.affinity.observeResult(m.currentConfig(), result)
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -2810,6 +3120,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		}
 		m.mu.Unlock()
 		if authSnapshot != nil {
+			m.reconcileAffinityAuthState(authSnapshot)
 			_ = m.persist(ctx, authSnapshot)
 		}
 		return

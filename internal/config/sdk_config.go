@@ -27,6 +27,9 @@ type SDKConfig struct {
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 
+	// Affinity configures optional user-to-auth sticky routing.
+	Affinity AffinityConfig `yaml:"affinity" json:"affinity"`
+
 	// NonStreamKeepAliveInterval controls how often blank lines are emitted for non-streaming responses.
 	// <= 0 disables keep-alives. Value is in seconds.
 	NonStreamKeepAliveInterval int `yaml:"nonstream-keepalive-interval,omitempty" json:"nonstream-keepalive-interval,omitempty"`
@@ -47,4 +50,22 @@ type StreamingConfig struct {
 	// failures can still retry transparently before the client sees partial output.
 	// <= 0 disables buffering. Default is 0.
 	BootstrapBufferMillis int `yaml:"bootstrap-buffer-millis,omitempty" json:"bootstrap-buffer-millis,omitempty"`
+}
+
+// AffinityConfig holds lease-based user affinity settings for auth selection.
+type AffinityConfig struct {
+	// Enabled toggles affinity observation / routing.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
+	// TrustedClientKeys restricts which downstream client API keys may supply affinity headers.
+	TrustedClientKeys []string `yaml:"trusted-client-keys,omitempty" json:"trusted-client-keys,omitempty"`
+
+	// ShadowMode records lease decisions without affecting real auth selection.
+	ShadowMode bool `yaml:"shadow-mode,omitempty" json:"shadow-mode,omitempty"`
+
+	// IdleTTLSeconds releases an idle lease after this many seconds.
+	IdleTTLSeconds int `yaml:"idle-ttl-seconds,omitempty" json:"idle-ttl-seconds,omitempty"`
+
+	// TransientBreakStrikes breaks a lease after this many transient failures.
+	TransientBreakStrikes int `yaml:"transient-break-strikes,omitempty" json:"transient-break-strikes,omitempty"`
 }

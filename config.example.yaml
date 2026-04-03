@@ -109,6 +109,16 @@ nonstream-keepalive-interval: 0
 #   bootstrap-retries: 1    # Default: 0 (disabled). Retries before first byte is sent.
 #   bootstrap-buffer-millis: 500 # Default: 0 (disabled). Delay first downstream flush briefly.
 
+# Optional lease-based user affinity routing.
+# Recommended first rollout is shadow-mode only.
+# affinity:
+#   enabled: true
+#   trusted-client-keys:
+#     - "cliproxy-client-key"
+#   shadow-mode: true
+#   idle-ttl-seconds: 1200
+#   transient-break-strikes: 3
+
 # Gemini API keys
 # gemini-api-key:
 #   - api-key: "AIzaSy...01"

@@ -29,6 +29,8 @@ func TestManager_WrapStreamResult_PostFirstChunkInterruptionStartsCooldown(t *te
 		auth.Clone(),
 		"codex",
 		"gpt-5-codex",
+		"",
+		0,
 		http.Header{},
 		[]cliproxyexecutor.StreamChunk{{Payload: []byte("data: hello\n\n")}},
 		remaining,
@@ -180,7 +182,7 @@ func TestManager_WrapStreamResult_UserCancellationDoesNotMarkInterruptionCooldow
 	remaining <- cliproxyexecutor.StreamChunk{Err: stderrors.New("context canceled")}
 	close(remaining)
 
-	result := manager.wrapStreamResult(ctx, auth.Clone(), "codex", "gpt-5-codex", http.Header{}, nil, remaining)
+	result := manager.wrapStreamResult(ctx, auth.Clone(), "codex", "gpt-5-codex", "", 0, http.Header{}, nil, remaining)
 	for range result.Chunks {
 	}
 

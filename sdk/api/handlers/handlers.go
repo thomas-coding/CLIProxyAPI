@@ -46,6 +46,7 @@ type ErrorDetail struct {
 }
 
 const idempotencyKeyMetadataKey = "idempotency_key"
+const affinityKeyHeader = "X-Arroute-Affinity-Key"
 
 const (
 	defaultStreamingKeepAliveSeconds = 0
@@ -200,7 +201,7 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
 }
 
-func requestExecutionMetadata(ctx context.Context) map[string]any {
+func requestExecutionMetadata(ctx context.Context, cfg *config.SDKConfig) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
 	key := ""
@@ -214,6 +215,9 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	}
 
 	meta := map[string]any{idempotencyKeyMetadataKey: key}
+	if affinityKey := trustedAffinityKeyFromRequest(ctx, cfg); affinityKey != "" {
+		meta[coreexecutor.AffinityKeyMetadataKey] = affinityKey
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -224,6 +228,67 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
 	return meta
+}
+
+func trustedAffinityKeyFromRequest(ctx context.Context, cfg *config.SDKConfig) string {
+	if ctx == nil || cfg == nil {
+		return ""
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return ""
+	}
+	affinityKey := strings.TrimSpace(ginCtx.GetHeader(affinityKeyHeader))
+	if affinityKey == "" {
+		return ""
+	}
+	clientKey := requestClientAPIKey(ginCtx.Request)
+	if clientKey == "" {
+		return ""
+	}
+	for _, trusted := range cfg.Affinity.TrustedClientKeys {
+		if strings.TrimSpace(trusted) == clientKey {
+			return affinityKey
+		}
+	}
+	return ""
+}
+
+func requestClientAPIKey(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHeader != "" {
+		return extractBearerToken(authHeader)
+	}
+	if key := strings.TrimSpace(r.Header.Get("X-Goog-Api-Key")); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(r.Header.Get("X-Api-Key")); key != "" {
+		return key
+	}
+	if r.URL == nil {
+		return ""
+	}
+	if key := strings.TrimSpace(r.URL.Query().Get("key")); key != "" {
+		return key
+	}
+	return strings.TrimSpace(r.URL.Query().Get("auth_token"))
+}
+
+func extractBearerToken(header string) string {
+	if header == "" {
+		return ""
+	}
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		return strings.TrimSpace(header)
+	}
+	if strings.ToLower(strings.TrimSpace(parts[0])) != "bearer" {
+		return strings.TrimSpace(header)
+	}
+	return strings.TrimSpace(parts[1])
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -487,7 +552,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := requestExecutionMetadata(ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -533,7 +598,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	if errMsg != nil {
 		return nil, nil, errMsg
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := requestExecutionMetadata(ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
@@ -583,7 +648,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		close(errChan)
 		return nil, nil, errChan
 	}
-	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta := requestExecutionMetadata(ctx, h.Cfg)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
 	payload := rawJSON
 	if len(payload) == 0 {
