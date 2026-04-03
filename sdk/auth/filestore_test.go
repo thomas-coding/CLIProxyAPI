@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -137,5 +138,36 @@ func TestFileTokenStore_SaveAndListRestoresRuntimeState(t *testing.T) {
 	}
 	if got.Attributes["path"] != filepath.Join(dir, "codex-auth.json") {
 		t.Fatalf("path = %q, want %q", got.Attributes["path"], filepath.Join(dir, "codex-auth.json"))
+	}
+}
+
+func TestFileTokenStore_ListIgnoresDeletedAuthBackup(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	store := NewFileTokenStore()
+	store.SetBaseDir(dir)
+
+	activePath := filepath.Join(dir, "active.json")
+	if err := os.WriteFile(activePath, []byte(`{"type":"codex","email":"active@example.com"}`), 0o644); err != nil {
+		t.Fatalf("write active auth: %v", err)
+	}
+	backupDir := filepath.Join(dir, "deleted-auth-backup", "20260401")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("mkdir backup dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "backup.json"), []byte(`{"type":"codex","email":"backup@example.com"}`), 0o644); err != nil {
+		t.Fatalf("write backup auth: %v", err)
+	}
+
+	entries, err := store.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+	if entries[0] == nil || entries[0].ID != "active.json" {
+		t.Fatalf("expected only active.json, got %+v", entries[0])
 	}
 }

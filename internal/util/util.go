@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -16,6 +17,10 @@ import (
 )
 
 var functionNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_.:-]`)
+
+var ignoredAuthDirNames = map[string]struct{}{
+	"deleted-auth-backup": {},
+}
 
 // SanitizeFunctionName ensures a function name matches the requirements for Gemini/Vertex AI.
 // It replaces invalid characters with underscores, ensures it starts with a letter or underscore,
@@ -91,6 +96,49 @@ func ResolveAuthDir(authDir string) (string, error) {
 		return filepath.Clean(filepath.Join(home, filepath.FromSlash(normalized))), nil
 	}
 	return filepath.Clean(authDir), nil
+}
+
+// IsIgnoredAuthDirName reports whether an auth subdirectory should be excluded
+// from runtime auth discovery.
+func IsIgnoredAuthDirName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if normalized == "" {
+		return false
+	}
+	_, ok := ignoredAuthDirNames[normalized]
+	return ok
+}
+
+// IsIgnoredAuthPath reports whether a path under the auth directory lives inside
+// an ignored subdirectory such as deleted-auth-backup.
+func IsIgnoredAuthPath(path, authDir string) bool {
+	cleanedPath := filepath.Clean(strings.TrimSpace(path))
+	cleanedAuthDir := filepath.Clean(strings.TrimSpace(authDir))
+	if cleanedPath == "" || cleanedAuthDir == "" {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		cleanedPath = strings.ToLower(strings.TrimPrefix(cleanedPath, `\\?\`))
+		cleanedAuthDir = strings.ToLower(strings.TrimPrefix(cleanedAuthDir, `\\?\`))
+	}
+	rel, err := filepath.Rel(cleanedAuthDir, cleanedPath)
+	if err != nil {
+		return false
+	}
+	rel = filepath.Clean(rel)
+	if rel == "." || rel == "" {
+		return false
+	}
+	parentEscape := ".." + string(os.PathSeparator)
+	if rel == ".." || strings.HasPrefix(rel, parentEscape) {
+		return false
+	}
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if IsIgnoredAuthDirName(part) {
+			return true
+		}
+	}
+	return false
 }
 
 // CountAuthFiles returns the number of auth records available through the provided Store.

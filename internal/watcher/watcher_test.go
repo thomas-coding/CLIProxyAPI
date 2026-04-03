@@ -675,6 +675,42 @@ func TestReloadClientsCachesAuthHashes(t *testing.T) {
 	}
 }
 
+func TestReloadClientsIgnoresDeletedAuthBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "one.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+	backupDir := filepath.Join(tmpDir, "deleted-auth-backup", "20260401")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("failed to create backup dir: %v", err)
+	}
+	backupFile := filepath.Join(backupDir, "backup.json")
+	if err := os.WriteFile(backupFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write backup auth file: %v", err)
+	}
+
+	w := &Watcher{
+		authDir: tmpDir,
+		config:  &config.Config{AuthDir: tmpDir},
+	}
+
+	if count := w.loadFileClients(w.config); count != 1 {
+		t.Fatalf("expected one active auth file, got %d", count)
+	}
+
+	w.reloadClients(true, nil, false)
+
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	if len(w.lastAuthHashes) != 1 {
+		t.Fatalf("expected hash cache for one active auth file, got %d", len(w.lastAuthHashes))
+	}
+	if _, ok := w.lastAuthHashes[w.normalizeAuthPath(backupFile)]; ok {
+		t.Fatal("expected deleted-auth-backup file to be ignored by hash cache")
+	}
+}
+
 func TestReloadClientsLogsConfigDiffs(t *testing.T) {
 	tmpDir := t.TempDir()
 	oldCfg := &config.Config{AuthDir: tmpDir, Port: 1, Debug: false}
@@ -997,6 +1033,44 @@ func TestHandleEventAuthWriteTriggersUpdate(t *testing.T) {
 	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
 	if atomic.LoadInt32(&reloads) != 0 {
 		t.Fatalf("expected auth write to avoid global reload callback, got %d", reloads)
+	}
+}
+
+func TestHandleEventIgnoresDeletedAuthBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	backupDir := filepath.Join(authDir, "deleted-auth-backup", "20260401")
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		t.Fatalf("failed to create backup dir: %v", err)
+	}
+	backupFile := filepath.Join(backupDir, "backup.json")
+	if err := os.WriteFile(backupFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write backup auth file: %v", err)
+	}
+
+	var reloads int32
+	w := &Watcher{
+		authDir:        authDir,
+		configPath:     configPath,
+		lastAuthHashes: make(map[string]string),
+		reloadCallback: func(*config.Config) { atomic.AddInt32(&reloads, 1) },
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+
+	w.handleEvent(fsnotify.Event{Name: backupFile, Op: fsnotify.Write})
+
+	if atomic.LoadInt32(&reloads) != 0 {
+		t.Fatalf("expected backup auth write to avoid global reload callback, got %d", reloads)
+	}
+	if len(w.lastAuthHashes) != 0 {
+		t.Fatalf("expected backup auth write to be ignored, got %d hash entries", len(w.lastAuthHashes))
 	}
 }
 
