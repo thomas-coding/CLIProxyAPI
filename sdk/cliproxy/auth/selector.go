@@ -400,10 +400,11 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return true, blockReasonOther, next
 					}
 				}
-				return false, blockReasonNone, time.Time{}
 			}
 		}
-		return false, blockReasonNone, time.Time{}
+	}
+	if blocked, next := authWide401BlockState(auth, now); blocked {
+		return true, blockReasonOther, next
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter

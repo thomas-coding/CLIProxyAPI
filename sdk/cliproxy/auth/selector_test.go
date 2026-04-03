@@ -311,6 +311,40 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_AuthWide401QuarantineOverridesModelAvailability(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	model := "test-model"
+	auth := &Auth{
+		ID:               "a",
+		Unavailable:      true,
+		NextRetryAfter:   now.Add(24 * time.Hour),
+		NextRefreshAfter: now.Add(24 * time.Hour),
+		LastError: &Error{
+			Code:       auth401KindTokenInvalidated,
+			Message:    `{"error":{"code":"token_invalidated","message":"Your authentication token has been invalidated. Please try signing in again."},"status":401}`,
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		ModelStates: map[string]*ModelState{
+			model: {
+				Status: StatusActive,
+			},
+		},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonOther {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonOther)
+	}
+	if !next.Equal(auth.NextRefreshAfter) {
+		t.Fatalf("next = %v, want %v", next, auth.NextRefreshAfter)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

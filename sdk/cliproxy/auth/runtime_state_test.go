@@ -127,3 +127,77 @@ func TestRestoreRuntimeState_RestoresDisabledFlagFromMetadata(t *testing.T) {
 		t.Fatalf("status = %q, want %q", auth.Status, StatusDisabled)
 	}
 }
+
+func TestRestoreRuntimeState_RestoresTokenInvalidatedQuarantineAndProbeSchedule(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	probeAt := now.Add(24 * time.Hour)
+	auth := &Auth{
+		Metadata:         map[string]any{"email": "cooling@example.com"},
+		Unavailable:      true,
+		NextRetryAfter:   probeAt,
+		NextRefreshAfter: probeAt,
+		LastError: &Error{
+			Code:       auth401KindTokenInvalidated,
+			Message:    `{"error":{"code":"token_invalidated","message":"Your authentication token has been invalidated. Please try signing in again."},"status":401}`,
+			HTTPStatus: 401,
+		},
+		Status:        StatusError,
+		StatusMessage: "token invalidated",
+	}
+
+	persisted := MetadataForPersistence(auth)
+	reloaded := &Auth{
+		Metadata: persisted,
+		Status:   StatusActive,
+	}
+	RestoreRuntimeState(reloaded)
+
+	if authWide401Quarantine(reloaded) != auth401KindTokenInvalidated {
+		t.Fatalf("quarantine kind = %q, want %q", authWide401Quarantine(reloaded), auth401KindTokenInvalidated)
+	}
+	if !reloaded.Unavailable {
+		t.Fatalf("expected reloaded auth to remain unavailable")
+	}
+	if !reloaded.NextRefreshAfter.Equal(probeAt) {
+		t.Fatalf("next refresh after = %v, want %v", reloaded.NextRefreshAfter, probeAt)
+	}
+}
+
+func TestRestoreRuntimeState_RestoresAccountDeactivatedQuarantine(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		Metadata:    map[string]any{"email": "disabled@example.com"},
+		Unavailable: true,
+		LastError: &Error{
+			Code:       auth401KindAccountDeactivated,
+			Message:    `{"error":{"code":"account_deactivated","message":"Your account has been deactivated."},"status":401}`,
+			HTTPStatus: 401,
+		},
+		Status:        StatusError,
+		StatusMessage: "account deactivated",
+	}
+
+	persisted := MetadataForPersistence(auth)
+	if _, ok := persisted[runtimeStateMetadataKey]; !ok {
+		t.Fatalf("expected runtime metadata for account_deactivated quarantine")
+	}
+
+	reloaded := &Auth{
+		Metadata: persisted,
+		Status:   StatusActive,
+	}
+	RestoreRuntimeState(reloaded)
+
+	if authWide401Quarantine(reloaded) != auth401KindAccountDeactivated {
+		t.Fatalf("quarantine kind = %q, want %q", authWide401Quarantine(reloaded), auth401KindAccountDeactivated)
+	}
+	if !reloaded.Unavailable {
+		t.Fatalf("expected reloaded auth to remain unavailable")
+	}
+	if !reloaded.NextRefreshAfter.IsZero() {
+		t.Fatalf("next refresh after = %v, want zero", reloaded.NextRefreshAfter)
+	}
+}

@@ -14,10 +14,11 @@ type persistedRuntimeState struct {
 }
 
 type persistedAuthRuntime struct {
-	NextRetryAfter time.Time   `json:"next_retry_after,omitempty"`
-	Quota          *QuotaState `json:"quota,omitempty"`
-	LastError      *Error      `json:"last_error,omitempty"`
-	StatusMessage  string      `json:"status_message,omitempty"`
+	NextRetryAfter   time.Time   `json:"next_retry_after,omitempty"`
+	NextRefreshAfter time.Time   `json:"next_refresh_after,omitempty"`
+	Quota            *QuotaState `json:"quota,omitempty"`
+	LastError        *Error      `json:"last_error,omitempty"`
+	StatusMessage    string      `json:"status_message,omitempty"`
 }
 
 type persistedModelRuntime struct {
@@ -149,14 +150,17 @@ func buildPersistedAuthRuntime(auth *Auth, now time.Time) *persistedAuthRuntime 
 	}
 	quota := clonePersistableQuota(auth.Quota, now)
 	nextRetry := persistedRetryAfter(auth.NextRetryAfter, quota, now)
-	if nextRetry.IsZero() && quota == nil {
+	nextRefresh := auth.NextRefreshAfter
+	quarantineKind := authWide401Quarantine(auth)
+	if nextRetry.IsZero() && quota == nil && nextRefresh.IsZero() && quarantineKind == auth401KindNone {
 		return nil
 	}
 	runtime := &persistedAuthRuntime{
-		NextRetryAfter: nextRetry,
-		Quota:          quota,
-		LastError:      cloneError(auth.LastError),
-		StatusMessage:  strings.TrimSpace(auth.StatusMessage),
+		NextRetryAfter:   nextRetry,
+		NextRefreshAfter: nextRefresh,
+		Quota:            quota,
+		LastError:        cloneError(auth.LastError),
+		StatusMessage:    strings.TrimSpace(auth.StatusMessage),
 	}
 	if runtime.StatusMessage == "" && runtime.LastError != nil {
 		runtime.StatusMessage = runtime.LastError.Message
@@ -238,6 +242,7 @@ func applyPersistedAuthRuntime(auth *Auth, persisted *persistedAuthRuntime, now 
 		return
 	}
 	auth.NextRetryAfter = persistedRetryAfter(persisted.NextRetryAfter, persisted.Quota, now)
+	auth.NextRefreshAfter = persisted.NextRefreshAfter
 	if persisted.Quota != nil {
 		auth.Quota = *persisted.Quota
 	} else {
@@ -313,6 +318,14 @@ func normalizeRestoredAuthState(auth *Auth, now time.Time) {
 		}
 		return
 	}
+	if authWide401Quarantine(auth) != auth401KindNone {
+		auth.Unavailable = true
+		auth.Status = StatusError
+		if auth.StatusMessage == "" && auth.LastError != nil {
+			auth.StatusMessage = auth.LastError.Message
+		}
+		return
+	}
 	if auth.Unavailable && !auth.NextRetryAfter.After(now) {
 		auth.Unavailable = false
 		auth.NextRetryAfter = time.Time{}
@@ -348,6 +361,10 @@ func mergePersistedAuthRuntime(auth *Auth, persisted *persistedRuntimeState, now
 	}
 	if auth.LastError == nil && persisted.Auth.LastError != nil {
 		auth.LastError = cloneError(persisted.Auth.LastError)
+	}
+	if auth.NextRefreshAfter.IsZero() ||
+		(!persisted.Auth.NextRefreshAfter.IsZero() && persisted.Auth.NextRefreshAfter.Before(auth.NextRefreshAfter)) {
+		auth.NextRefreshAfter = persisted.Auth.NextRefreshAfter
 	}
 	if auth.StatusMessage == "" {
 		auth.StatusMessage = strings.TrimSpace(persisted.Auth.StatusMessage)

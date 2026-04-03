@@ -1626,82 +1626,86 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				previousLastError := cloneError(state.LastError)
-				previousUpdatedAt := state.UpdatedAt
-				previousNextRetryAfter := state.NextRetryAfter
-				state.Unavailable = true
-				state.Status = StatusError
-				state.UpdatedAt = now
-				if result.Error != nil {
-					state.LastError = cloneError(result.Error)
-					state.StatusMessage = result.Error.Message
-					auth.LastError = cloneError(result.Error)
-					auth.StatusMessage = result.Error.Message
-				}
-
-				if isStreamInterruptedError(result.Error) {
-					next := now.Add(nextStreamInterruptedCooldown(previousLastError, previousUpdatedAt, previousNextRetryAfter, now))
-					if next.After(state.NextRetryAfter) {
-						state.NextRetryAfter = next
-					}
-					suspendReason = streamInterruptedCode
-					shouldSuspendModel = true
+				if auth401QuarantineKind(result.Error) != auth401KindNone {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 				} else {
-					statusCode := statusCodeFromResult(result.Error)
-					switch statusCode {
-					case 401:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "unauthorized"
-						shouldSuspendModel = true
-					case 402, 403:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "payment_required"
-						shouldSuspendModel = true
-					case 404:
-						next := now.Add(12 * time.Hour)
-						state.NextRetryAfter = next
-						suspendReason = "not_found"
-						shouldSuspendModel = true
-					case 429:
-						var next time.Time
-						backoffLevel := state.Quota.BackoffLevel
-						if result.RetryAfter != nil {
-							next = now.Add(*result.RetryAfter)
-						} else {
-							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-							if cooldown > 0 {
-								next = now.Add(cooldown)
-							}
-							backoffLevel = nextLevel
-						}
-						state.NextRetryAfter = next
-						state.Quota = QuotaState{
-							Exceeded:      true,
-							Reason:        "quota",
-							NextRecoverAt: next,
-							BackoffLevel:  backoffLevel,
-						}
-						suspendReason = "quota"
-						shouldSuspendModel = true
-						setModelQuota = true
-					case 408, 500, 502, 503, 504:
-						if quotaCooldownDisabledForAuth(auth) {
-							state.NextRetryAfter = time.Time{}
-						} else {
-							next := now.Add(1 * time.Minute)
+					state := ensureModelState(auth, result.Model)
+					previousLastError := cloneError(state.LastError)
+					previousUpdatedAt := state.UpdatedAt
+					previousNextRetryAfter := state.NextRetryAfter
+					state.Unavailable = true
+					state.Status = StatusError
+					state.UpdatedAt = now
+					if result.Error != nil {
+						state.LastError = cloneError(result.Error)
+						state.StatusMessage = result.Error.Message
+						auth.LastError = cloneError(result.Error)
+						auth.StatusMessage = result.Error.Message
+					}
+
+					if isStreamInterruptedError(result.Error) {
+						next := now.Add(nextStreamInterruptedCooldown(previousLastError, previousUpdatedAt, previousNextRetryAfter, now))
+						if next.After(state.NextRetryAfter) {
 							state.NextRetryAfter = next
 						}
-					default:
-						state.NextRetryAfter = time.Time{}
+						suspendReason = streamInterruptedCode
+						shouldSuspendModel = true
+					} else {
+						statusCode := statusCodeFromResult(result.Error)
+						switch statusCode {
+						case 401:
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							suspendReason = "unauthorized"
+							shouldSuspendModel = true
+						case 402, 403:
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							suspendReason = "payment_required"
+							shouldSuspendModel = true
+						case 404:
+							next := now.Add(12 * time.Hour)
+							state.NextRetryAfter = next
+							suspendReason = "not_found"
+							shouldSuspendModel = true
+						case 429:
+							var next time.Time
+							backoffLevel := state.Quota.BackoffLevel
+							if result.RetryAfter != nil {
+								next = now.Add(*result.RetryAfter)
+							} else {
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+								if cooldown > 0 {
+									next = now.Add(cooldown)
+								}
+								backoffLevel = nextLevel
+							}
+							state.NextRetryAfter = next
+							state.Quota = QuotaState{
+								Exceeded:      true,
+								Reason:        "quota",
+								NextRecoverAt: next,
+								BackoffLevel:  backoffLevel,
+							}
+							suspendReason = "quota"
+							shouldSuspendModel = true
+							setModelQuota = true
+						case 408, 500, 502, 503, 504:
+							if quotaCooldownDisabledForAuth(auth) {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(1 * time.Minute)
+								state.NextRetryAfter = next
+							}
+						default:
+							state.NextRetryAfter = time.Time{}
+						}
 					}
-				}
 
-				auth.Status = StatusError
-				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
@@ -1759,7 +1763,16 @@ func resetModelState(state *ModelState, now time.Time) {
 }
 
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
-	if auth == nil || len(auth.ModelStates) == 0 {
+	if auth == nil {
+		return
+	}
+	quarantineBlocked, quarantineNext := authWide401BlockState(auth, now)
+	if len(auth.ModelStates) == 0 {
+		if quarantineBlocked {
+			auth.Unavailable = true
+			auth.NextRetryAfter = quarantineNext
+			auth.Quota = QuotaState{}
+		}
 		return
 	}
 	allUnavailable := true
@@ -1800,11 +1813,18 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			}
 		}
 	}
-	auth.Unavailable = allUnavailable
-	if allUnavailable {
+	auth.Unavailable = quarantineBlocked || allUnavailable
+	switch {
+	case quarantineBlocked:
+		auth.NextRetryAfter = quarantineNext
+	case allUnavailable:
 		auth.NextRetryAfter = earliestRetry
-	} else {
+	default:
 		auth.NextRetryAfter = time.Time{}
+	}
+	if quarantineBlocked {
+		auth.Quota = QuotaState{}
+		return
 	}
 	if quotaExceeded {
 		auth.Quota.Exceeded = true
@@ -1907,6 +1927,9 @@ func resultErrorFromExecutionError(err error) *Error {
 		Message:    err.Error(),
 		HTTPStatus: statusCodeFromError(err),
 	}
+	if kind := auth401QuarantineKind(resultErr); kind != auth401KindNone {
+		resultErr.Code = kind
+	}
 	if isStreamInterruptedError(resultErr) {
 		resultErr.Code = streamInterruptedCode
 		resultErr.Retryable = true
@@ -2002,25 +2025,38 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	auth.Unavailable = true
 	auth.Status = StatusError
 	auth.UpdatedAt = now
+	auth.NextRefreshAfter = time.Time{}
 	if resultErr != nil {
-		auth.LastError = cloneError(resultErr)
-		if resultErr.Message != "" {
-			auth.StatusMessage = resultErr.Message
+		auth.LastError = normalize401Error(resultErr)
+		if auth.LastError != nil && auth.LastError.Message != "" {
+			auth.StatusMessage = auth.LastError.Message
 		}
+	}
+	if auth401QuarantineKind(auth.LastError) != auth401KindNone {
+		applyAuth401Quarantine(auth, auth.LastError, now)
+		return
 	}
 	statusCode := statusCodeFromResult(resultErr)
 	switch statusCode {
 	case 401:
-		auth.StatusMessage = "unauthorized"
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = "unauthorized"
+		}
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 402, 403:
-		auth.StatusMessage = "payment_required"
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = "payment_required"
+		}
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 404:
-		auth.StatusMessage = "not_found"
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = "not_found"
+		}
 		auth.NextRetryAfter = now.Add(12 * time.Hour)
 	case 429:
-		auth.StatusMessage = "quota exhausted"
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = "quota exhausted"
+		}
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
@@ -2036,7 +2072,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
-		auth.StatusMessage = "transient upstream error"
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = "transient upstream error"
+		}
 		if quotaCooldownDisabledForAuth(auth) {
 			auth.NextRetryAfter = time.Time{}
 		} else {
@@ -2498,6 +2536,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
+	if kind := authWide401Quarantine(a); kind != auth401KindNone {
+		return kind == auth401KindTokenInvalidated
+	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return evaluator.ShouldRefresh(now, a)
 	}
@@ -2734,16 +2775,43 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		refreshErr := resultErrorFromExecutionError(err)
+		var authSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			switch authWide401Quarantine(current) {
+			case auth401KindTokenInvalidated:
+				if auth401QuarantineKind(refreshErr) != auth401KindAccountDeactivated {
+					if refreshErr == nil {
+						refreshErr = &Error{Message: err.Error()}
+					}
+					refreshErr.Code = auth401KindTokenInvalidated
+				}
+				applyAuthFailureState(current, refreshErr, nil, now)
+			default:
+				if auth401QuarantineKind(refreshErr) != auth401KindNone {
+					applyAuthFailureState(current, refreshErr, nil, now)
+				} else {
+					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+					current.LastError = normalize401Error(refreshErr)
+					if current.LastError == nil {
+						current.LastError = &Error{Message: err.Error()}
+					}
+					current.Status = StatusError
+					current.StatusMessage = current.LastError.Message
+					current.UpdatedAt = now
+				}
+			}
 			m.auths[id] = current
+			authSnapshot = current.Clone()
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.scheduler.upsertAuth(authSnapshot)
 			}
 		}
 		m.mu.Unlock()
+		if authSnapshot != nil {
+			_ = m.persist(ctx, authSnapshot)
+		}
 		return
 	}
 	if updated == nil {
@@ -2754,10 +2822,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if updated.Runtime == nil {
 		updated.Runtime = auth.Runtime
 	}
+	updated.ModelStates = auth.ModelStates
 	updated.LastRefreshedAt = now
-	updated.NextRefreshAfter = time.Time{}
-	updated.LastError = nil
-	updated.UpdatedAt = now
+	clearAuthStateAfterSuccessfulRefresh(updated, now)
 	_, _ = m.Update(ctx, updated)
 }
 
