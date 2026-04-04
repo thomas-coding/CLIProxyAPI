@@ -214,6 +214,9 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 }
 
 func ginContextFrom(ctx context.Context) *gin.Context {
+	if ctx == nil {
+		return nil
+	}
 	ginCtx, _ := ctx.Value("gin").(*gin.Context)
 	return ginCtx
 }

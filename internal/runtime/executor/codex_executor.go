@@ -18,9 +18,7 @@ import (
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -34,8 +32,6 @@ import (
 )
 
 const (
-	codexClientVersion                   = "0.101.0"
-	codexUserAgent                       = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 	codexTransparentClientHeadersHeader  = "X-Arroute-Client-Headers"
 	codexTransparentClientQueryHeader    = "X-Arroute-Client-Query"
 	codexTransparentSnapshotStatusHeader = "X-Arroute-Transparent-Snapshot-Status"
@@ -128,11 +124,6 @@ func (e *CodexExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Aut
 	if strings.TrimSpace(apiKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(req, attrs)
 	return nil
 }
 
@@ -340,8 +331,7 @@ func applyTransparentCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 			r.Header.Set("Accept", "application/json")
 		}
 	}
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithConfigPrecedence(r.Header, nil, "User-Agent", cfgUserAgent, codexUserAgent)
+	ensureCodexUserAgent(r.Header, nil, r.Context(), auth, cfg)
 	if token = strings.TrimSpace(token); token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	} else {
@@ -370,11 +360,6 @@ func applyTransparentCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, toke
 		}
 	}
 
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
 func copyTransparentCodexHeaders(target, source http.Header) {
@@ -1300,17 +1285,16 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", codexClientVersion)
-	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	ensureHeaderWithPriority(r.Header, ginHeaders, "Version", "", "")
+	ensureHeaderWithPriority(r.Header, ginHeaders, "Session_id", "", "")
+	ensureCodexUserAgent(r.Header, ginHeaders, r.Context(), auth, cfg)
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 	} else {
 		r.Header.Set("Accept", "application/json")
 	}
-	r.Header.Set("Connection", "Keep-Alive")
+	ensureHeaderWithPriority(r.Header, ginHeaders, "Originator", "", "")
 
 	isAPIKey := false
 	if auth != nil && auth.Attributes != nil {
@@ -1319,18 +1303,12 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		}
 	}
 	if !isAPIKey {
-		r.Header.Set("Originator", "codex_cli_rs")
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				r.Header.Set("Chatgpt-Account-Id", accountID)
 			}
 		}
 	}
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(r, attrs)
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {

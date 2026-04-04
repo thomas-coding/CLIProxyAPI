@@ -20,7 +20,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -813,13 +812,13 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	cfgUserAgent, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
+	_, cfgBetaFeatures := codexHeaderDefaults(cfg, auth)
 	ensureHeaderWithPriority(headers, ginHeaders, "x-codex-beta-features", cfgBetaFeatures, "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-state", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-codex-turn-metadata", "")
 	misc.EnsureHeader(headers, ginHeaders, "x-responsesapi-include-timing-metrics", "")
 
-	misc.EnsureHeader(headers, ginHeaders, "Version", codexClientVersion)
+	ensureHeaderWithPriority(headers, ginHeaders, "Version", "", "")
 	betaHeader := strings.TrimSpace(headers.Get("OpenAI-Beta"))
 	if betaHeader == "" && ginHeaders != nil {
 		betaHeader = strings.TrimSpace(ginHeaders.Get("OpenAI-Beta"))
@@ -828,8 +827,9 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		betaHeader = codexResponsesWebsocketBetaHeaderValue
 	}
 	headers.Set("OpenAI-Beta", betaHeader)
-	misc.EnsureHeader(headers, ginHeaders, "Session_id", uuid.NewString())
-	ensureHeaderWithConfigPrecedence(headers, ginHeaders, "User-Agent", cfgUserAgent, codexUserAgent)
+	ensureHeaderWithPriority(headers, ginHeaders, "Session_id", "", "")
+	ensureCodexUserAgent(headers, ginHeaders, ctx, auth, cfg)
+	ensureHeaderWithPriority(headers, ginHeaders, "Originator", "", "")
 
 	isAPIKey := false
 	if auth != nil && auth.Attributes != nil {
@@ -838,7 +838,6 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 		}
 	}
 	if !isAPIKey {
-		headers.Set("Originator", "codex_cli_rs")
 		if auth != nil && auth.Metadata != nil {
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				if trimmed := strings.TrimSpace(accountID); trimmed != "" {
@@ -847,12 +846,6 @@ func applyCodexWebsocketHeaders(ctx context.Context, headers http.Header, auth *
 			}
 		}
 	}
-
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(&http.Request{Header: headers}, attrs)
 
 	return headers
 }

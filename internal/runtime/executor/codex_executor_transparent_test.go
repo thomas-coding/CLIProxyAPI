@@ -48,9 +48,13 @@ func TestCodexExecutorExecute_DefaultOffKeepsLegacyRequestShaping(t *testing.T) 
 		},
 	}
 	body := []byte(`{"model":"alias-model","stream":false,"store":true,"previous_response_id":"resp-prev","prompt_cache_retention":{"policy":"keep"},"safety_identifier":"safe-1","user":"user-1","context_management":{"compaction":"auto"}}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		codexAffinityKeyHeader: "user:legacy",
+	})
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
 
 	resp, err := executor.Execute(
-		context.Background(),
+		ctx,
 		auth,
 		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
 		cliproxyexecutor.Options{
@@ -103,17 +107,23 @@ func TestCodexExecutorExecute_DefaultOffKeepsLegacyRequestShaping(t *testing.T) 
 	if got := seenHeaders.Get("Chatgpt-Account-Id"); got != "acct-123" {
 		t.Fatalf("Chatgpt-Account-Id = %q, want %q", got, "acct-123")
 	}
-	if got := seenHeaders.Get("Originator"); got != "codex_cli_rs" {
-		t.Fatalf("Originator = %q, want %q", got, "codex_cli_rs")
+	if got := seenHeaders.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
 	}
-	if got := seenHeaders.Get("Version"); got != codexClientVersion {
-		t.Fatalf("Version = %q, want %q", got, codexClientVersion)
+	if got := seenHeaders.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
 	}
-	if got := seenHeaders.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %q, want %q", got, codexUserAgent)
+	if got := seenHeaders.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
 	}
-	if strings.TrimSpace(seenHeaders.Get("Session_id")) == "" {
-		t.Fatalf("legacy upstream must synthesize Session_id")
+	if got := seenHeaders.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty", got)
+	}
+	if got := seenHeaders.Get("Connection"); got != "" {
+		t.Fatalf("Connection = %q, want empty", got)
+	}
+	if got := seenHeaders.Get(codexAffinityKeyHeader); got != "" {
+		t.Fatalf("%s = %q, want empty", codexAffinityKeyHeader, got)
 	}
 
 	if got := gjson.GetBytes(resp.Payload, "id").String(); got != "resp_1" {
@@ -121,6 +131,76 @@ func TestCodexExecutorExecute_DefaultOffKeepsLegacyRequestShaping(t *testing.T) 
 	}
 	if got := gjson.GetBytes(resp.Payload, "object").String(); got != "response" {
 		t.Fatalf("response object = %q, want %q", got, "response")
+	}
+}
+
+func TestCodexExecutorPrepareRequestDropsCustomHeaderAttrs(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"header:X-Gateway-ID": "gw-1",
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+		},
+	}
+
+	if err := executor.PrepareRequest(req, auth); err != nil {
+		t.Fatalf("PrepareRequest() error = %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer oauth-token" {
+		t.Fatalf("Authorization = %q, want %q", got, "Bearer oauth-token")
+	}
+	if got := req.Header.Get("X-Gateway-Id"); got != "" {
+		t.Fatalf("X-Gateway-Id = %q, want empty", got)
+	}
+}
+
+func TestCodexExecutorExecute_DefaultOffPreservesDirectClientUserAgent(t *testing.T) {
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_direct_ua\",\"object\":\"response\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+		},
+	}
+	body := []byte(`{"model":"gpt-5","stream":false}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		"User-Agent": "direct-client-ua",
+	})
+
+	_, err := executor.Execute(
+		ctx,
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: body,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := seenHeaders.Get("User-Agent"); got != "direct-client-ua" {
+		t.Fatalf("User-Agent = %q, want %q", got, "direct-client-ua")
 	}
 }
 
@@ -252,8 +332,8 @@ func TestCodexExecutorExecute_TransparentOnPreservesClientShape(t *testing.T) {
 	if got := seenHeaders.Get("X-Stainless-Lang"); got != "js" {
 		t.Fatalf("X-Stainless-Lang = %q, want %q", got, "js")
 	}
-	if got := seenHeaders.Get("X-Gateway-Id"); got != "gw-1" {
-		t.Fatalf("X-Gateway-Id = %q, want %q headers=%v", got, "gw-1", seenHeaders)
+	if got := seenHeaders.Get("X-Gateway-Id"); got != "" {
+		t.Fatalf("X-Gateway-Id = %q, want empty", got)
 	}
 	if got := seenHeaders.Get("Accept"); got != "application/json" {
 		t.Fatalf("Accept = %q, want %q", got, "application/json")
@@ -467,6 +547,121 @@ func TestCodexExecutorExecute_TransparentOnFallsBackToConfiguredUserAgent(t *tes
 	}
 }
 
+func TestCodexExecutorExecute_TransparentOnFallsBackToBoundUserAgent(t *testing.T) {
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_bound_ua","object":"response","status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			CodexRelay: config.CodexRelayConfig{TransparentMode: "on"},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+		},
+	}
+	body := []byte(`{"model":"gpt-5","stream":false}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		"Accept":               "application/json",
+		codexAffinityKeyHeader: "user:15",
+	})
+
+	_, err := executor.Execute(
+		ctx,
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: body,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := seenHeaders.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
+	}
+	if got := seenHeaders.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+	if got := seenHeaders.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty", got)
+	}
+	if got := seenHeaders.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
+	}
+	if got := seenHeaders.Get(codexAffinityKeyHeader); got != "" {
+		t.Fatalf("%s = %q, want empty", codexAffinityKeyHeader, got)
+	}
+}
+
+func TestCodexExecutorExecute_TransparentOnIgnoresInternalHopUserAgent(t *testing.T) {
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_internal_ua","object":"response","status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			CodexRelay: config.CodexRelayConfig{TransparentMode: "on"},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+		},
+	}
+	body := []byte(`{"model":"gpt-5","stream":false}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		"User-Agent": "Go-http-client/1.1",
+		"Accept":     "application/json",
+		codexTransparentClientHeadersHeader: encodeTransparentSnapshotHeadersForTest(map[string]string{
+			"Accept": "application/json",
+		}),
+		codexAffinityKeyHeader: "user:internal-hop",
+	})
+
+	_, err := executor.Execute(
+		ctx,
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: body,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := seenHeaders.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
+	}
+	if got := seenHeaders.Get("User-Agent"); got == "Go-http-client/1.1" {
+		t.Fatalf("User-Agent must not keep internal hop UA")
+	}
+}
+
 func TestCodexExecutorExecute_TransparentOnMalformedSnapshotFallsBackToLegacyRequestShaping(t *testing.T) {
 	var seenBody []byte
 	var seenHeaders http.Header
@@ -498,12 +693,15 @@ func TestCodexExecutorExecute_TransparentOnMalformedSnapshotFallsBackToLegacyReq
 		},
 	}
 	body := []byte(`{"model":"gpt-5","stream":false,"previous_response_id":"resp-prev"}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		"User-Agent":                        "Go-http-client/1.1",
+		"Accept":                            "application/json",
+		codexTransparentClientHeadersHeader: "%%%not-base64%%%",
+		codexAffinityKeyHeader:              "user:fallback",
+	})
 
 	_, err := executor.Execute(
-		contextWithGinRequest("/v1/responses", map[string]string{
-			"Accept":                            "application/json",
-			codexTransparentClientHeadersHeader: "%%%not-base64%%%",
-		}),
+		ctx,
 		auth,
 		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
 		cliproxyexecutor.Options{
@@ -521,14 +719,18 @@ func TestCodexExecutorExecute_TransparentOnMalformedSnapshotFallsBackToLegacyReq
 	if gjson.GetBytes(seenBody, "previous_response_id").Exists() {
 		t.Fatalf("legacy fallback must drop previous_response_id")
 	}
-	if got := seenHeaders.Get("Version"); got != codexClientVersion {
-		t.Fatalf("Version = %q, want %q", got, codexClientVersion)
+	if got := seenHeaders.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
 	}
-	if got := seenHeaders.Get("Originator"); got != "codex_cli_rs" {
-		t.Fatalf("Originator = %q, want %q", got, "codex_cli_rs")
+	if got := seenHeaders.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
 	}
-	if strings.TrimSpace(seenHeaders.Get("Session_id")) == "" {
-		t.Fatal("legacy fallback must synthesize Session_id")
+	if got := seenHeaders.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty", got)
+	}
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := seenHeaders.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
 	}
 }
 
@@ -563,12 +765,15 @@ func TestCodexExecutorExecute_TransparentOnSnapshotStatusFallsBackToLegacyReques
 		},
 	}
 	body := []byte(`{"model":"gpt-5","stream":false}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		"User-Agent":                         "Go-http-client/1.1",
+		"Accept":                             "application/json",
+		codexTransparentSnapshotStatusHeader: "headers_oversize",
+		codexAffinityKeyHeader:               "user:status-fallback",
+	})
 
 	_, err := executor.Execute(
-		contextWithGinRequest("/v1/responses", map[string]string{
-			"Accept":                             "application/json",
-			codexTransparentSnapshotStatusHeader: "headers_oversize",
-		}),
+		ctx,
 		auth,
 		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
 		cliproxyexecutor.Options{
@@ -583,8 +788,12 @@ func TestCodexExecutorExecute_TransparentOnSnapshotStatusFallsBackToLegacyReques
 	if !gjson.GetBytes(seenBody, "stream").Bool() {
 		t.Fatalf("legacy fallback must force stream=true")
 	}
-	if got := seenHeaders.Get("Version"); got != codexClientVersion {
-		t.Fatalf("Version = %q, want %q", got, codexClientVersion)
+	if got := seenHeaders.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := seenHeaders.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
 	}
 }
 
@@ -643,7 +852,7 @@ func TestCodexExecutorExecute_TransparentOnDecodesCompressedResponse(t *testing.
 	}
 }
 
-func TestCodexExecutorExecute_TransparentOnApiKeyKeepsCustomHeaders(t *testing.T) {
+func TestCodexExecutorExecute_TransparentOnApiKeyDropsCustomHeaders(t *testing.T) {
 	var seenHeaders http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenHeaders = r.Header.Clone()
@@ -685,8 +894,8 @@ func TestCodexExecutorExecute_TransparentOnApiKeyKeepsCustomHeaders(t *testing.T
 	if got := seenHeaders.Get("Authorization"); got != "Bearer sk-test" {
 		t.Fatalf("Authorization = %q, want %q", got, "Bearer sk-test")
 	}
-	if got := seenHeaders.Get("X-Gateway-Id"); got != "gw-api-key" {
-		t.Fatalf("X-Gateway-Id = %q, want %q", got, "gw-api-key")
+	if got := seenHeaders.Get("X-Gateway-Id"); got != "" {
+		t.Fatalf("X-Gateway-Id = %q, want empty", got)
 	}
 	if got := seenHeaders.Get("Chatgpt-Account-Id"); got != "" {
 		t.Fatalf("Chatgpt-Account-Id = %q, want empty for api_key auth", got)

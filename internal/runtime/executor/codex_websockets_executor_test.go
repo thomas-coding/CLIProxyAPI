@@ -38,11 +38,20 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	if got := headers.Get("OpenAI-Beta"); got != codexResponsesWebsocketBetaHeaderValue {
 		t.Fatalf("OpenAI-Beta = %s, want %s", got, codexResponsesWebsocketBetaHeaderValue)
 	}
-	if got := headers.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
+	if got := headers.Get("User-Agent"); got != codexBoundFallbackUserAgent(context.Background(), nil) {
+		t.Fatalf("User-Agent = %s, want fallback pool UA", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+	if got := headers.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+	if got := headers.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty", got)
+	}
+	if got := headers.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
 	}
 }
 
@@ -55,6 +64,9 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 	}
 	auth := &cliproxyauth.Auth{
 		Provider: "codex",
+		Attributes: map[string]string{
+			"header:X-Gateway-ID": "gw-1",
+		},
 		Metadata: map[string]any{"email": "user@example.com"},
 	}
 
@@ -140,11 +152,14 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "sk-test", cfg)
 
-	if got := headers.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
+	if got := headers.Get("User-Agent"); got != codexBoundFallbackUserAgent(context.Background(), auth) {
+		t.Fatalf("User-Agent = %s, want bound fallback UA", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+	if got := headers.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
 	}
 }
 
@@ -174,6 +189,34 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 	if got := req.Header.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+	if got := req.Header.Get("Version"); got != "" {
+		t.Fatalf("Version = %q, want empty", got)
+	}
+	if got := req.Header.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty", got)
+	}
+	if got := req.Header.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %q, want empty", got)
+	}
+	if got := req.Header.Get("X-Gateway-Id"); got != "" {
+		t.Fatalf("X-Gateway-Id = %q, want empty", got)
+	}
+}
+
+func TestApplyCodexWebsocketHeadersDropsCustomHeaderAttrs(t *testing.T) {
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"header:X-Gateway-ID": "gw-1",
+		},
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", &config.Config{})
+
+	if got := headers.Get("X-Gateway-Id"); got != "" {
+		t.Fatalf("X-Gateway-Id = %q, want empty", got)
 	}
 }
 

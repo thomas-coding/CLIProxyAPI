@@ -8,9 +8,11 @@ config.yaml
 
 # Generated content
 bin/*
+build/*
 logs/*
 conv/*
 temp/*
+.tmp/*
 refs/*
 
 # Storage backends
