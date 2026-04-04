@@ -27,6 +27,9 @@ type SDKConfig struct {
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 
+	// CodexRelay configures how closely Codex upstream requests follow the inbound client request.
+	CodexRelay CodexRelayConfig `yaml:"codex-relay" json:"codex-relay"`
+
 	// Affinity configures optional user-to-auth sticky routing.
 	Affinity AffinityConfig `yaml:"affinity" json:"affinity"`
 
@@ -50,6 +53,16 @@ type StreamingConfig struct {
 	// failures can still retry transparently before the client sees partial output.
 	// <= 0 disables buffering. Default is 0.
 	BootstrapBufferMillis int `yaml:"bootstrap-buffer-millis,omitempty" json:"bootstrap-buffer-millis,omitempty"`
+}
+
+// CodexRelayConfig holds Codex upstream relay transparency settings.
+type CodexRelayConfig struct {
+	// TransparentMode controls how /v1/responses requests are built for Codex upstreams.
+	// Supported values:
+	//   - "off": keep legacy request shaping
+	//   - "shadow": keep legacy live traffic but compare it against transparent request building
+	//   - "on": send the transparent request upstream
+	TransparentMode string `yaml:"transparent-mode,omitempty" json:"transparent-mode,omitempty"`
 }
 
 // AffinityConfig holds lease-based user affinity settings for auth selection.

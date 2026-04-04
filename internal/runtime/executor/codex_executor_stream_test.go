@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"compress/gzip"
 	"context"
 	"io"
 	"net/http"
@@ -62,5 +63,71 @@ func TestCodexExecutorExecuteStream_ReturnsErrorWhenResponseCompletedIsMissing(t
 	}
 	if !strings.Contains(terminalErr.Error(), "response.completed") {
 		t.Fatalf("error = %q, want response.completed detail", terminalErr.Error())
+	}
+}
+
+func TestCodexExecutorExecuteStream_TransparentOnDecodesCompressedStream(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		_, _ = io.WriteString(gz, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n")
+		_, _ = io.WriteString(gz, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		_ = gz.Close()
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			CodexRelay: config.CodexRelayConfig{TransparentMode: "on"},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+		},
+	}
+
+	result, err := executor.ExecuteStream(
+		contextWithGinRequest("/v1/responses", map[string]string{
+			"Accept": "text/event-stream",
+			codexTransparentClientHeadersHeader: encodeTransparentSnapshotHeadersForTest(map[string]string{
+				"Accept-Encoding": "gzip",
+			}),
+		}),
+		auth,
+		cliproxyexecutor.Request{
+			Model:   "gpt-5",
+			Payload: []byte(`{"model":"gpt-5","stream":true}`),
+		},
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: []byte(`{"model":"gpt-5","stream":true}`),
+		},
+	)
+	if err != nil {
+		t.Fatalf("ExecuteStream: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("expected stream result")
+	}
+
+	var chunks [][]byte
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected stream error: %v", chunk.Err)
+		}
+		if len(chunk.Payload) > 0 {
+			chunks = append(chunks, append([]byte(nil), chunk.Payload...))
+		}
+	}
+	if len(chunks) == 0 {
+		t.Fatal("expected decoded stream chunks")
 	}
 }

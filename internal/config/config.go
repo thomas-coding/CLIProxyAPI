@@ -632,6 +632,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
+	// Sanitize Codex relay behavior.
+	cfg.SanitizeCodexRelay()
+
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 
@@ -729,6 +732,23 @@ func (cfg *Config) SanitizeCodexHeaderDefaults() {
 	}
 	cfg.CodexHeaderDefaults.UserAgent = strings.TrimSpace(cfg.CodexHeaderDefaults.UserAgent)
 	cfg.CodexHeaderDefaults.BetaFeatures = strings.TrimSpace(cfg.CodexHeaderDefaults.BetaFeatures)
+}
+
+// SanitizeCodexRelay normalizes the configured Codex transparent relay mode.
+func (cfg *Config) SanitizeCodexRelay() {
+	if cfg == nil {
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.CodexRelay.TransparentMode))
+	switch mode {
+	case "", "off":
+		cfg.CodexRelay.TransparentMode = "off"
+	case "shadow", "on":
+		cfg.CodexRelay.TransparentMode = mode
+	default:
+		log.WithField("mode", cfg.CodexRelay.TransparentMode).Warn("invalid codex-relay.transparent-mode, defaulting to off")
+		cfg.CodexRelay.TransparentMode = "off"
+	}
 }
 
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
