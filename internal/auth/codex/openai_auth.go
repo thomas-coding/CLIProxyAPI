@@ -5,6 +5,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -21,14 +22,13 @@ import (
 
 // OAuth configuration constants for OpenAI Codex
 const (
-	AuthURL                = "https://auth.openai.com/oauth/authorize"
-	TokenURL               = "https://auth.openai.com/oauth/token"
-	ClientID               = "app_EMoamEEZ73f0CkXaXp7hrann"
-	RedirectURI            = "http://localhost:1455/auth/callback"
-	CodexAuthOriginator    = "codex_cli_rs"
-	CodexAuthUserAgent     = "codex_cli_rs/0.0.0 (Ubuntu 24.04; x86_64) vscode/1.86.0"
-	CodexAuthorizeScope    = "openid email profile offline_access"
-	CodexRefreshTokenScope = "openid profile email"
+	AuthURL             = "https://auth.openai.com/oauth/authorize"
+	TokenURL            = "https://auth.openai.com/oauth/token"
+	ClientID            = "app_EMoamEEZ73f0CkXaXp7hrann"
+	RedirectURI         = "http://localhost:1455/auth/callback"
+	CodexAuthOriginator = "codex_cli_rs"
+	CodexAuthUserAgent  = "codex_cli_rs/0.0.0 (Ubuntu 24.04; x86_64) vscode/1.86.0"
+	CodexAuthorizeScope = "openid email profile offline_access"
 )
 
 // CodexAuth handles the OpenAI OAuth2 authentication flow.
@@ -126,7 +126,7 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
 
-	applyCodexTokenHeaders(req)
+	applyCodexCodeExchangeHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -199,19 +199,26 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 		return nil, fmt.Errorf("refresh token is required")
 	}
 
-	data := url.Values{
-		"client_id":     {ClientID},
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {refreshToken},
-		"scope":         {CodexRefreshTokenScope},
+	// Keep code exchange on the existing form flow; only refresh moves to the minimal JSON shape.
+	payload, err := json.Marshal(struct {
+		ClientID     string `json:"client_id"`
+		GrantType    string `json:"grant_type"`
+		RefreshToken string `json:"refresh_token"`
+	}{
+		ClientID:     ClientID,
+		GrantType:    "refresh_token",
+		RefreshToken: refreshToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode refresh request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
 
-	applyCodexTokenHeaders(req)
+	applyCodexRefreshHeaders(req)
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -333,11 +340,26 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 	storage.Expire = tokenData.Expire
 }
 
-func applyCodexTokenHeaders(req *http.Request) {
+func applyCodexCodeExchangeHeaders(req *http.Request) {
 	if req == nil {
 		return
 	}
+	applyCodexOAuthHeaders(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+}
+
+func applyCodexRefreshHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
+	applyCodexOAuthHeaders(req)
+	req.Header.Set("Content-Type", "application/json")
+}
+
+func applyCodexOAuthHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("originator", CodexAuthOriginator)
 	req.Header.Set("User-Agent", CodexAuthUserAgent)

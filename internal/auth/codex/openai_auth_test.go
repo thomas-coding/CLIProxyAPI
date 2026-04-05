@@ -193,8 +193,8 @@ func TestRefreshTokensUsesConfiguredCodexHeaders(t *testing.T) {
 	if seenAccept != "application/json" {
 		t.Fatalf("Accept = %q, want application/json", seenAccept)
 	}
-	if seenContentType != "application/x-www-form-urlencoded" {
-		t.Fatalf("Content-Type = %q, want application/x-www-form-urlencoded", seenContentType)
+	if seenContentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", seenContentType)
 	}
 	if seenOriginator != CodexAuthOriginator {
 		t.Fatalf("originator = %q, want %q", seenOriginator, CodexAuthOriginator)
@@ -243,21 +243,21 @@ func TestRefreshTokensSendsExpectedPayloadAndParsesTokenData(t *testing.T) {
 		t.Fatalf("path = %q, want %q", seenPath, "/oauth/token")
 	}
 
-	form, err := url.ParseQuery(seenBody)
-	if err != nil {
-		t.Fatalf("url.ParseQuery returned error: %v", err)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(seenBody), &payload); err != nil {
+		t.Fatalf("json.Unmarshal returned error: %v", err)
 	}
-	if got := form.Get("client_id"); got != ClientID {
+	if got, _ := payload["client_id"].(string); got != ClientID {
 		t.Fatalf("client_id = %q, want %q", got, ClientID)
 	}
-	if got := form.Get("grant_type"); got != "refresh_token" {
+	if got, _ := payload["grant_type"].(string); got != "refresh_token" {
 		t.Fatalf("grant_type = %q, want %q", got, "refresh_token")
 	}
-	if got := form.Get("refresh_token"); got != "refresh_123" {
+	if got, _ := payload["refresh_token"].(string); got != "refresh_123" {
 		t.Fatalf("refresh_token = %q, want %q", got, "refresh_123")
 	}
-	if got := form.Get("scope"); got != CodexRefreshTokenScope {
-		t.Fatalf("scope = %q, want %q", got, CodexRefreshTokenScope)
+	if got, ok := payload["scope"]; ok {
+		t.Fatalf("unexpected scope in refresh payload: %#v", got)
 	}
 
 	if tokenData.AccessToken != "new_at" {
