@@ -2113,7 +2113,10 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		if !stateUnavailable {
 			allUnavailable = false
 		}
-		if state.Quota.Exceeded {
+		if state.Quota.Exceeded && !modelStateQuotaActive(state, now) {
+			state.Quota = QuotaState{}
+		}
+		if modelStateQuotaActive(state, now) {
 			quotaExceeded = true
 			if quotaRecover.IsZero() || (!state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.Before(quotaRecover)) {
 				quotaRecover = state.Quota.NextRecoverAt
@@ -2147,6 +2150,133 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
 	}
+}
+
+// DerivedAuthErrorFromModelStates returns the highest-priority auth-level reason
+// inferred from unavailable/error model states without mutating auth state.
+func DerivedAuthErrorFromModelStates(auth *Auth, now time.Time) (*Error, string) {
+	if auth == nil || len(auth.ModelStates) == 0 {
+		return nil, ""
+	}
+	var (
+		bestErr     *Error
+		bestMessage string
+		bestScore   = -1
+		bestUpdated time.Time
+	)
+
+	for _, state := range auth.ModelStates {
+		errValue, message, score := aggregatedModelStateReason(state, now)
+		if score < 0 {
+			continue
+		}
+		updatedAt := time.Time{}
+		if state != nil {
+			updatedAt = state.UpdatedAt
+		}
+		if score > bestScore || (score == bestScore && updatedAt.After(bestUpdated)) {
+			bestErr = errValue
+			bestMessage = message
+			bestScore = score
+			bestUpdated = updatedAt
+		}
+	}
+
+	if bestErr != nil {
+		return bestErr, bestMessage
+	}
+	if strings.TrimSpace(bestMessage) != "" {
+		return nil, bestMessage
+	}
+	return nil, ""
+}
+
+func modelStateQuotaActive(state *ModelState, now time.Time) bool {
+	return state != nil &&
+		state.Quota.Exceeded &&
+		!state.Quota.NextRecoverAt.IsZero() &&
+		state.Quota.NextRecoverAt.After(now)
+}
+
+func aggregatedModelStateReason(state *ModelState, now time.Time) (*Error, string, int) {
+	if state == nil {
+		return nil, "", -1
+	}
+
+	quotaActive := modelStateQuotaActive(state, now)
+	stateUnavailable := false
+	switch {
+	case state.Status == StatusDisabled:
+		stateUnavailable = true
+	case state.Unavailable && state.NextRetryAfter.After(now):
+		stateUnavailable = true
+	case quotaActive:
+		stateUnavailable = true
+	}
+	if !stateUnavailable {
+		return nil, "", -1
+	}
+
+	if state.LastError != nil {
+		errValue := cloneError(state.LastError)
+		if errValue.Message == "" {
+			errValue.Message = strings.TrimSpace(state.StatusMessage)
+		}
+		if errValue.HTTPStatus == 0 && quotaActive {
+			errValue.HTTPStatus = 429
+		}
+		if quotaActive {
+			errValue.Retryable = true
+		}
+		if errValue.Message != "" {
+			return errValue, errValue.Message, aggregatedModelStateReasonScore(errValue, quotaActive)
+		}
+	}
+
+	if quotaActive {
+		message := strings.TrimSpace(state.StatusMessage)
+		if message == "" {
+			message = strings.TrimSpace(state.Quota.Reason)
+		}
+		if message == "" {
+			message = "quota exhausted"
+		}
+		return &Error{
+			Code:       "usage_limit_reached",
+			Message:    message,
+			Retryable:  true,
+			HTTPStatus: 429,
+		}, message, 200
+	}
+
+	if message := strings.TrimSpace(state.StatusMessage); message != "" {
+		return &Error{
+			Message:   message,
+			Retryable: state.NextRetryAfter.After(now),
+		}, message, 100
+	}
+
+	return &Error{
+		Code:      "auth_unavailable",
+		Message:   "temporary unavailable",
+		Retryable: state.NextRetryAfter.After(now),
+	}, "temporary unavailable", 0
+}
+
+func aggregatedModelStateReasonScore(errValue *Error, quotaActive bool) int {
+	if errValue == nil {
+		return 0
+	}
+	if auth401QuarantineKind(errValue) != auth401KindNone || errValue.HTTPStatus == 401 {
+		return 300
+	}
+	if quotaActive {
+		return 200
+	}
+	if errValue.HTTPStatus == 429 || strings.Contains(strings.ToLower(errValue.Message), "quota") {
+		return 200
+	}
+	return 100
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {

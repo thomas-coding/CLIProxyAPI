@@ -171,6 +171,44 @@ func TestSynthesizeAuthFile_RestoresPersistedRuntimeState(t *testing.T) {
 	}
 }
 
+func TestSynthesizeAuthFile_UsesFileModTimeForTimestamps(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "codex-auth.json")
+	modTime := time.Date(2026, 4, 4, 11, 2, 38, 0, time.UTC)
+
+	data, err := json.Marshal(map[string]any{
+		"type":  "codex",
+		"email": "mtime@example.com",
+	})
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	if err = os.WriteFile(filePath, data, 0o644); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	if err = os.Chtimes(filePath, modTime, modTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	auths := SynthesizeAuthFile(&SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         modTime.Add(10 * time.Minute),
+		IDGenerator: NewStableIDGenerator(),
+	}, filePath, data)
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+
+	auth := auths[0]
+	if !auth.UpdatedAt.Equal(modTime) {
+		t.Fatalf("updated_at = %v, want %v", auth.UpdatedAt, modTime)
+	}
+	if !auth.CreatedAt.Equal(modTime) {
+		t.Fatalf("created_at = %v, want %v", auth.CreatedAt, modTime)
+	}
+}
+
 func TestFileSynthesizer_Synthesize_GeminiProviderMapping(t *testing.T) {
 	tempDir := t.TempDir()
 

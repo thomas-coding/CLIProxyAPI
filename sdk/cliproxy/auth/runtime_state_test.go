@@ -27,7 +27,7 @@ func TestMetadataForPersistence_OmitsRuntimeStateWhenAuthIsActive(t *testing.T) 
 	}
 }
 
-func TestRestoreRuntimeState_RestoresBlockedAuthAndModelCooldowns(t *testing.T) {
+func TestRestoreRuntimeState_RestoresBlockedAuthCooldownOnly(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
@@ -46,21 +46,6 @@ func TestRestoreRuntimeState_RestoresBlockedAuthAndModelCooldowns(t *testing.T) 
 			HTTPStatus: 429,
 		},
 		StatusMessage: "quota reached",
-		ModelStates: map[string]*ModelState{
-			"gpt-5-codex": {
-				Status:         StatusError,
-				Unavailable:    true,
-				NextRetryAfter: now.Add(20 * time.Minute),
-				LastError: &Error{
-					Message:    "stream incomplete",
-					HTTPStatus: 408,
-				},
-				StatusMessage: "stream incomplete",
-			},
-			"healthy-model": {
-				Status: StatusActive,
-			},
-		},
 	}
 
 	persisted := MetadataForPersistence(auth)
@@ -92,21 +77,74 @@ func TestRestoreRuntimeState_RestoresBlockedAuthAndModelCooldowns(t *testing.T) 
 	if reloaded.StatusMessage != "quota reached" {
 		t.Fatalf("status message = %q, want quota reached", reloaded.StatusMessage)
 	}
-	if len(reloaded.ModelStates) != 1 {
-		t.Fatalf("expected only blocked model state to persist, got %d", len(reloaded.ModelStates))
-	}
-	modelState := reloaded.ModelStates["gpt-5-codex"]
-	if modelState == nil {
-		t.Fatalf("expected blocked model state to be restored")
-	}
-	if !modelState.Unavailable {
-		t.Fatalf("expected restored model state to be unavailable")
-	}
-	if modelState.Status != StatusError {
-		t.Fatalf("model status = %q, want %q", modelState.Status, StatusError)
+	if len(reloaded.ModelStates) != 0 {
+		t.Fatalf("expected no persisted model states after restore, got %d", len(reloaded.ModelStates))
 	}
 	if _, ok := reloaded.Metadata[runtimeStateMetadataKey]; ok {
 		t.Fatalf("expected runtime metadata key to be removed from in-memory metadata")
+	}
+}
+
+func TestRestoreRuntimeState_DoesNotPromotePartialModelQuotaToAuthUnavailable(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	auth := &Auth{
+		Metadata: map[string]any{"email": "derived@example.com"},
+		ModelStates: map[string]*ModelState{
+			"healthy-model": {
+				Status: StatusActive,
+			},
+			"gpt-5-codex": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: now.Add(20 * time.Minute),
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: now.Add(25 * time.Minute),
+				},
+				LastError: &Error{
+					Message:    "quota exhausted",
+					HTTPStatus: 429,
+					Retryable:  true,
+				},
+				UpdatedAt: now.Add(-2 * time.Minute),
+			},
+		},
+	}
+	updateAggregatedAvailability(auth, now)
+	if auth.Unavailable {
+		t.Fatalf("auth.Unavailable = true, want false before persistence")
+	}
+	if !auth.Quota.Exceeded {
+		t.Fatalf("expected aggregated auth quota to be exceeded before persistence")
+	}
+
+	persisted := MetadataForPersistence(auth)
+	if _, ok := persisted[runtimeStateMetadataKey]; ok {
+		t.Fatalf("expected auth-wide runtime to be omitted for partial model cooldowns")
+	}
+	reloaded := &Auth{
+		Metadata: persisted,
+		Status:   StatusActive,
+	}
+	RestoreRuntimeState(reloaded)
+
+	if reloaded.Unavailable {
+		t.Fatalf("reloaded auth became unavailable, want auth to remain selectable")
+	}
+	if !reloaded.NextRetryAfter.IsZero() {
+		t.Fatalf("next retry after = %v, want zero", reloaded.NextRetryAfter)
+	}
+	if reloaded.Status != StatusActive {
+		t.Fatalf("status = %q, want %q", reloaded.Status, StatusActive)
+	}
+	if reloaded.Quota.Exceeded {
+		t.Fatalf("quota should not be restored from partial model cooldowns")
+	}
+	if len(reloaded.ModelStates) != 0 {
+		t.Fatalf("expected no model states to persist, got %d", len(reloaded.ModelStates))
 	}
 }
 
@@ -199,5 +237,43 @@ func TestRestoreRuntimeState_RestoresAccountDeactivatedQuarantine(t *testing.T) 
 	}
 	if !reloaded.NextRefreshAfter.IsZero() {
 		t.Fatalf("next refresh after = %v, want zero", reloaded.NextRefreshAfter)
+	}
+}
+
+func TestRestoreRuntimeState_RestoresRefreshBackoff(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	nextRefresh := now.Add(5 * time.Minute)
+	auth := &Auth{
+		Metadata:         map[string]any{"email": "refresh@example.com"},
+		NextRefreshAfter: nextRefresh,
+		LastError: &Error{
+			Message:    "refresh failed",
+			HTTPStatus: 502,
+			Retryable:  true,
+		},
+		Status:        StatusError,
+		StatusMessage: "refresh failed",
+	}
+
+	persisted := MetadataForPersistence(auth)
+	reloaded := &Auth{
+		Metadata: persisted,
+		Status:   StatusActive,
+	}
+	RestoreRuntimeState(reloaded)
+
+	if !reloaded.NextRefreshAfter.Equal(nextRefresh) {
+		t.Fatalf("next refresh after = %v, want %v", reloaded.NextRefreshAfter, nextRefresh)
+	}
+	if reloaded.Status != StatusError {
+		t.Fatalf("status = %q, want %q", reloaded.Status, StatusError)
+	}
+	if reloaded.StatusMessage != "refresh failed" {
+		t.Fatalf("status message = %q, want refresh failed", reloaded.StatusMessage)
+	}
+	if reloaded.LastError == nil || reloaded.LastError.Message != "refresh failed" {
+		t.Fatalf("last error = %#v, want refresh failed", reloaded.LastError)
 	}
 }

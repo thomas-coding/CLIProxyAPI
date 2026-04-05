@@ -70,6 +70,10 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		return nil
 	}
 	now := ctx.Now
+	fileTimestamp := now
+	if info, err := os.Stat(fullPath); err == nil {
+		fileTimestamp = info.ModTime()
+	}
 	cfg := ctx.Config
 	var metadata map[string]any
 	if errUnmarshal := json.Unmarshal(data, &metadata); errUnmarshal != nil {
@@ -134,8 +138,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		},
 		ProxyURL:  proxyURL,
 		Metadata:  metadata,
-		CreatedAt: now,
-		UpdatedAt: now,
+		CreatedAt: fileTimestamp,
+		UpdatedAt: fileTimestamp,
 	}
 	coreauth.RestoreRuntimeState(a)
 	// Read priority from auth file.

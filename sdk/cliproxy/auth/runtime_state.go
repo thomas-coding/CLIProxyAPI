@@ -9,8 +9,7 @@ import (
 const runtimeStateMetadataKey = "_cliproxy_runtime"
 
 type persistedRuntimeState struct {
-	Auth       *persistedAuthRuntime             `json:"auth,omitempty"`
-	ModelState map[string]*persistedModelRuntime `json:"model_states,omitempty"`
+	Auth *persistedAuthRuntime `json:"auth,omitempty"`
 }
 
 type persistedAuthRuntime struct {
@@ -21,18 +20,9 @@ type persistedAuthRuntime struct {
 	StatusMessage    string      `json:"status_message,omitempty"`
 }
 
-type persistedModelRuntime struct {
-	Status         Status      `json:"status,omitempty"`
-	NextRetryAfter time.Time   `json:"next_retry_after,omitempty"`
-	Quota          *QuotaState `json:"quota,omitempty"`
-	LastError      *Error      `json:"last_error,omitempty"`
-	StatusMessage  string      `json:"status_message,omitempty"`
-	UpdatedAt      time.Time   `json:"updated_at,omitempty"`
-}
-
 // MetadataForPersistence returns a metadata snapshot suitable for store persistence.
 // It keeps operator-managed metadata intact while adding only the runtime state needed
-// to preserve auth/model cooldown decisions across restarts.
+// to preserve auth-wide runtime state across restarts.
 func MetadataForPersistence(auth *Auth) map[string]any {
 	if auth == nil {
 		return nil
@@ -65,7 +55,7 @@ func MetadataForPersistence(auth *Auth) map[string]any {
 	return meta
 }
 
-// RestoreRuntimeState rehydrates persisted cooldown state from metadata after loading an auth.
+// RestoreRuntimeState rehydrates persisted auth-wide runtime state from metadata after loading an auth.
 func RestoreRuntimeState(auth *Auth) {
 	if auth == nil {
 		return
@@ -80,18 +70,12 @@ func RestoreRuntimeState(auth *Auth) {
 	persisted := decodePersistedRuntimeState(auth)
 	if persisted != nil {
 		applyPersistedAuthRuntime(auth, persisted.Auth, time.Now())
-		applyPersistedModelRuntime(auth, persisted.ModelState, time.Now())
 	}
 	if auth.Metadata != nil {
 		delete(auth.Metadata, runtimeStateMetadataKey)
 	}
 
-	now := time.Now()
-	if len(auth.ModelStates) > 0 {
-		updateAggregatedAvailability(auth, now)
-	}
-	mergePersistedAuthRuntime(auth, persisted, now)
-	normalizeRestoredAuthState(auth, now)
+	normalizeRestoredAuthState(auth, time.Now())
 }
 
 func cloneMetadataMap(src map[string]any) map[string]any {
@@ -124,21 +108,8 @@ func buildPersistedRuntimeState(auth *Auth, now time.Time) *persistedRuntimeStat
 		return nil
 	}
 
-	state := &persistedRuntimeState{
-		Auth: buildPersistedAuthRuntime(auth, now),
-	}
-	if len(auth.ModelStates) > 0 {
-		models := make(map[string]*persistedModelRuntime, len(auth.ModelStates))
-		for model, modelState := range auth.ModelStates {
-			if persisted := buildPersistedModelRuntime(modelState, now); persisted != nil {
-				models[model] = persisted
-			}
-		}
-		if len(models) > 0 {
-			state.ModelState = models
-		}
-	}
-	if state.Auth == nil && len(state.ModelState) == 0 {
+	state := &persistedRuntimeState{Auth: buildPersistedAuthRuntime(auth, now)}
+	if state.Auth == nil {
 		return nil
 	}
 	return state
@@ -148,8 +119,18 @@ func buildPersistedAuthRuntime(auth *Auth, now time.Time) *persistedAuthRuntime 
 	if auth == nil || auth.Disabled {
 		return nil
 	}
-	quota := clonePersistableQuota(auth.Quota, now)
-	nextRetry := persistedRetryAfter(auth.NextRetryAfter, quota, now)
+
+	var (
+		quota     *QuotaState
+		nextRetry time.Time
+	)
+	if auth.Unavailable && auth.NextRetryAfter.After(now) {
+		nextRetry = auth.NextRetryAfter
+		quota = clonePersistableQuota(auth.Quota, now)
+		if quota != nil && quota.NextRecoverAt.After(nextRetry) {
+			nextRetry = quota.NextRecoverAt
+		}
+	}
 	nextRefresh := auth.NextRefreshAfter
 	quarantineKind := authWide401Quarantine(auth)
 	if nextRetry.IsZero() && quota == nil && nextRefresh.IsZero() && quarantineKind == auth401KindNone {
@@ -161,32 +142,6 @@ func buildPersistedAuthRuntime(auth *Auth, now time.Time) *persistedAuthRuntime 
 		Quota:            quota,
 		LastError:        cloneError(auth.LastError),
 		StatusMessage:    strings.TrimSpace(auth.StatusMessage),
-	}
-	if runtime.StatusMessage == "" && runtime.LastError != nil {
-		runtime.StatusMessage = runtime.LastError.Message
-	}
-	return runtime
-}
-
-func buildPersistedModelRuntime(state *ModelState, now time.Time) *persistedModelRuntime {
-	if state == nil {
-		return nil
-	}
-	quota := clonePersistableQuota(state.Quota, now)
-	nextRetry := persistedRetryAfter(state.NextRetryAfter, quota, now)
-	persistStatus := state.Status == StatusDisabled
-	if nextRetry.IsZero() && quota == nil && !persistStatus {
-		return nil
-	}
-	runtime := &persistedModelRuntime{
-		NextRetryAfter: nextRetry,
-		Quota:          quota,
-		LastError:      cloneError(state.LastError),
-		StatusMessage:  strings.TrimSpace(state.StatusMessage),
-		UpdatedAt:      state.UpdatedAt,
-	}
-	if persistStatus {
-		runtime.Status = state.Status
 	}
 	if runtime.StatusMessage == "" && runtime.LastError != nil {
 		runtime.StatusMessage = runtime.LastError.Message
@@ -256,57 +211,6 @@ func applyPersistedAuthRuntime(auth *Auth, persisted *persistedAuthRuntime, now 
 	}
 }
 
-func applyPersistedModelRuntime(auth *Auth, persisted map[string]*persistedModelRuntime, now time.Time) {
-	if auth == nil || len(persisted) == 0 {
-		return
-	}
-	auth.ModelStates = make(map[string]*ModelState, len(persisted))
-	for model, runtime := range persisted {
-		restored := restoreModelState(runtime, now)
-		if restored != nil {
-			auth.ModelStates[model] = restored
-		}
-	}
-	if len(auth.ModelStates) == 0 {
-		auth.ModelStates = nil
-	}
-}
-
-func restoreModelState(runtime *persistedModelRuntime, now time.Time) *ModelState {
-	if runtime == nil {
-		return nil
-	}
-	state := &ModelState{
-		Status:         runtime.Status,
-		NextRetryAfter: persistedRetryAfter(runtime.NextRetryAfter, runtime.Quota, now),
-		LastError:      cloneError(runtime.LastError),
-		StatusMessage:  strings.TrimSpace(runtime.StatusMessage),
-		UpdatedAt:      runtime.UpdatedAt,
-	}
-	if runtime.Quota != nil {
-		state.Quota = *runtime.Quota
-	}
-	if state.StatusMessage == "" && state.LastError != nil {
-		state.StatusMessage = state.LastError.Message
-	}
-	if state.Status == "" {
-		if state.NextRetryAfter.After(now) || state.Quota.Exceeded || state.LastError != nil {
-			state.Status = StatusError
-		} else {
-			state.Status = StatusActive
-		}
-	}
-	if state.Status == StatusDisabled {
-		state.Unavailable = true
-		return state
-	}
-	state.Unavailable = state.NextRetryAfter.After(now)
-	if !state.Unavailable && !state.Quota.Exceeded {
-		return nil
-	}
-	return state
-}
-
 func normalizeRestoredAuthState(auth *Auth, now time.Time) {
 	if auth == nil {
 		return
@@ -320,6 +224,13 @@ func normalizeRestoredAuthState(auth *Auth, now time.Time) {
 	}
 	if authWide401Quarantine(auth) != auth401KindNone {
 		auth.Unavailable = true
+		auth.Status = StatusError
+		if auth.StatusMessage == "" && auth.LastError != nil {
+			auth.StatusMessage = auth.LastError.Message
+		}
+		return
+	}
+	if auth.NextRefreshAfter.After(now) {
 		auth.Status = StatusError
 		if auth.StatusMessage == "" && auth.LastError != nil {
 			auth.StatusMessage = auth.LastError.Message
@@ -343,33 +254,4 @@ func normalizeRestoredAuthState(auth *Auth, now time.Time) {
 	auth.Status = StatusActive
 	auth.LastError = nil
 	auth.StatusMessage = ""
-}
-
-func mergePersistedAuthRuntime(auth *Auth, persisted *persistedRuntimeState, now time.Time) {
-	if auth == nil || persisted == nil || persisted.Auth == nil {
-		return
-	}
-	nextRetry := persistedRetryAfter(persisted.Auth.NextRetryAfter, persisted.Auth.Quota, now)
-	if nextRetry.After(auth.NextRetryAfter) {
-		auth.NextRetryAfter = nextRetry
-		auth.Unavailable = true
-	}
-	if persisted.Auth.Quota != nil {
-		if !auth.Quota.Exceeded || persisted.Auth.Quota.NextRecoverAt.After(auth.Quota.NextRecoverAt) {
-			auth.Quota = *persisted.Auth.Quota
-		}
-	}
-	if auth.LastError == nil && persisted.Auth.LastError != nil {
-		auth.LastError = cloneError(persisted.Auth.LastError)
-	}
-	if auth.NextRefreshAfter.IsZero() ||
-		(!persisted.Auth.NextRefreshAfter.IsZero() && persisted.Auth.NextRefreshAfter.Before(auth.NextRefreshAfter)) {
-		auth.NextRefreshAfter = persisted.Auth.NextRefreshAfter
-	}
-	if auth.StatusMessage == "" {
-		auth.StatusMessage = strings.TrimSpace(persisted.Auth.StatusMessage)
-		if auth.StatusMessage == "" && auth.LastError != nil {
-			auth.StatusMessage = auth.LastError.Message
-		}
-	}
 }

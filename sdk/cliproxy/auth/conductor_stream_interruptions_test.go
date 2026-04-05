@@ -201,7 +201,7 @@ func TestManager_WrapStreamResult_UserCancellationDoesNotMarkInterruptionCooldow
 	}
 }
 
-func TestRestoreRuntimeState_PreservesStreamInterruptionEscalationWindow(t *testing.T) {
+func TestRestoreRuntimeState_DoesNotPersistStreamInterruptionModelState(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
@@ -232,35 +232,9 @@ func TestRestoreRuntimeState_PreservesStreamInterruptionEscalationWindow(t *test
 	}
 	RestoreRuntimeState(reloaded)
 
-	state := reloaded.ModelStates["gpt-5-codex"]
-	if state == nil {
-		t.Fatalf("expected restored model state")
+	if len(reloaded.ModelStates) != 0 {
+		t.Fatalf("expected no model states after restore, got %d", len(reloaded.ModelStates))
 	}
-	if state.UpdatedAt.IsZero() {
-		t.Fatalf("expected UpdatedAt to be restored")
-	}
-
-	manager := NewManager(nil, nil, nil)
-	if _, errRegister := manager.Register(context.Background(), reloaded); errRegister != nil {
-		t.Fatalf("register reloaded auth: %v", errRegister)
-	}
-
-	start := time.Now()
-	manager.MarkResult(context.Background(), Result{
-		AuthID:   reloaded.ID,
-		Provider: "codex",
-		Model:    "gpt-5-codex",
-		Success:  false,
-		Error: &Error{
-			Code:       streamInterruptedCode,
-			Message:    "stream error: stream disconnected before completion",
-			Retryable:  true,
-			HTTPStatus: http.StatusRequestTimeout,
-		},
-	})
-
-	state = mustModelState(t, manager, reloaded.ID, "gpt-5-codex")
-	assertCooldownWithin(t, state.NextRetryAfter, start, 59*time.Minute, 61*time.Minute)
 }
 
 func mustModelState(t *testing.T, manager *Manager, authID, model string) *ModelState {

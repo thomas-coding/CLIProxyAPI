@@ -357,6 +357,23 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if name == "" {
 		name = auth.ID
 	}
+	statusMessage := strings.TrimSpace(auth.StatusMessage)
+	lastError := auth.LastError
+	shouldDeriveModelReason := (auth.Status == coreauth.StatusError || auth.Unavailable) &&
+		(statusMessage == "" || lastError == nil)
+	if shouldDeriveModelReason {
+		if derivedError, derivedMessage := coreauth.DerivedAuthErrorFromModelStates(auth, time.Now()); derivedError != nil || strings.TrimSpace(derivedMessage) != "" {
+			if lastError == nil {
+				lastError = derivedError
+			}
+			if statusMessage == "" {
+				statusMessage = strings.TrimSpace(derivedMessage)
+			}
+		}
+	}
+	if statusMessage == "" && lastError != nil {
+		statusMessage = strings.TrimSpace(lastError.Message)
+	}
 	entry := gin.H{
 		"id":             auth.ID,
 		"auth_index":     auth.Index,
@@ -365,7 +382,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"provider":       strings.TrimSpace(auth.Provider),
 		"label":          auth.Label,
 		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
+		"status_message": statusMessage,
 		"disabled":       auth.Disabled,
 		"unavailable":    auth.Unavailable,
 		"runtime_only":   runtimeOnly,
@@ -395,6 +412,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if !auth.NextRetryAfter.IsZero() {
 		entry["next_retry_after"] = auth.NextRetryAfter
+	}
+	if lastError != nil {
+		entry["last_error"] = lastError
+	}
+	if auth.Quota.Exceeded {
+		entry["quota"] = auth.Quota
 	}
 	if path != "" {
 		entry["path"] = path
