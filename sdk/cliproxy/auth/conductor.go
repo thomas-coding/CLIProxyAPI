@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +73,15 @@ const (
 	streamInterruptedMaxCooldown    = 6 * time.Hour
 	streamInterruptedRetryWindow    = 30 * time.Minute
 	streamInterruptedEscalateWindow = 6 * time.Hour
+
+	codexOnUseRefreshLead             = 2 * time.Minute
+	codexOnUseRefreshStaleAfter       = 7 * 24 * time.Hour
+	codexColdKeepaliveInterval        = 6 * time.Hour
+	codexColdKeepaliveInitialJitter   = 30 * time.Minute
+	codexColdKeepaliveMinSpacing      = 24 * time.Hour
+	codexColdKeepaliveCoverageDivisor = 28
+	codexHardRefreshWaitTimeout       = 2 * time.Second
+	codexHardRefreshPollInterval      = 100 * time.Millisecond
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1124,6 +1134,24 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			continue
 		}
+		tried[auth.ID] = struct{}{}
+		preparedAuth, errPrepare := m.prepareAuthForExecution(ctx, auth)
+		if errPrepare != nil {
+			if affinityPinned && m.affinity != nil && affinityKey != "" {
+				if m.affinity.releaseLease(affinityKey, auth.ID) {
+					pickOpts = opts
+					affinityPinned = false
+					clear(selectionSkipped)
+				}
+			}
+			if errCtx := ctx.Err(); errCtx != nil {
+				return cliproxyexecutor.Response{}, errCtx
+			}
+			lastErr = errPrepare
+			continue
+		}
+		auth = preparedAuth
+
 		execOpts := opts
 		if enforceAffinityOwnership {
 			claimedOpts, claimedAuthID, claimed := m.affinity.claimSelection(cfg, affinityKey, auth.ID, opts)
@@ -1148,7 +1176,6 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(execOpts.Metadata, auth.ID)
 
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1257,11 +1284,11 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			}
 			continue
 		}
+		tried[auth.ID] = struct{}{}
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1417,6 +1444,24 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			continue
 		}
+		tried[auth.ID] = struct{}{}
+		preparedAuth, errPrepare := m.prepareAuthForExecution(ctx, auth)
+		if errPrepare != nil {
+			if affinityPinned && m.affinity != nil && affinityKey != "" {
+				if m.affinity.releaseLease(affinityKey, auth.ID) {
+					pickOpts = opts
+					affinityPinned = false
+					clear(selectionSkipped)
+				}
+			}
+			if errCtx := ctx.Err(); errCtx != nil {
+				return nil, errCtx
+			}
+			lastErr = errPrepare
+			continue
+		}
+		auth = preparedAuth
+
 		execOpts := opts
 		if enforceAffinityOwnership {
 			claimedOpts, claimedAuthID, claimed := m.affinity.claimSelection(cfg, affinityKey, auth.ID, opts)
@@ -1441,7 +1486,6 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		debugLogAuthSelection(entry, auth, provider, req.Model)
 		publishSelectedAuthMetadata(execOpts.Metadata, auth.ID)
 
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -2899,6 +2943,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.refreshCancel = cancel
+	go m.runCodexColdKeepalive(ctx)
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -2969,6 +3014,183 @@ func (m *Manager) snapshotAuths() []*Auth {
 	return out
 }
 
+func isCodexProvider(provider string) bool {
+	return strings.EqualFold(strings.TrimSpace(provider), "codex")
+}
+
+func authEffectiveLastRefresh(a *Auth) time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	if !a.LastRefreshedAt.IsZero() {
+		return a.LastRefreshedAt
+	}
+	if ts, ok := authLastRefreshTimestamp(a); ok {
+		return ts
+	}
+	return time.Time{}
+}
+
+func authLastRefreshAttemptTimestamp(a *Auth) (time.Time, bool) {
+	if a == nil || a.Metadata == nil {
+		return time.Time{}, false
+	}
+	return lookupMetadataTime(a.Metadata, "last_refresh_attempt_at", "lastRefreshAttemptAt")
+}
+
+func authEffectiveRefreshActivity(a *Auth) time.Time {
+	lastRefresh := authEffectiveLastRefresh(a)
+	if ts, ok := authLastRefreshAttemptTimestamp(a); ok && ts.After(lastRefresh) {
+		return ts
+	}
+	return lastRefresh
+}
+
+type codexOnUseRefreshMode uint8
+
+const (
+	codexOnUseRefreshNone codexOnUseRefreshMode = iota
+	codexOnUseRefreshSoft
+	codexOnUseRefreshHard
+)
+
+func codexOnUseRefreshModeForAuth(a *Auth, now time.Time) codexOnUseRefreshMode {
+	if a == nil || !isCodexProvider(a.Provider) || a.Disabled || isAPIKeyAuth(a) {
+		return codexOnUseRefreshNone
+	}
+	if authWide401Quarantine(a) != auth401KindNone {
+		return codexOnUseRefreshNone
+	}
+	expiry, hasExpiry := a.ExpirationTime()
+	if hasExpiry && !expiry.IsZero() {
+		if !expiry.After(now) {
+			return codexOnUseRefreshHard
+		}
+		if expiry.Sub(now) <= codexOnUseRefreshLead {
+			return codexOnUseRefreshSoft
+		}
+	}
+	lastRefresh := authEffectiveLastRefresh(a)
+	if !lastRefresh.IsZero() && now.Sub(lastRefresh) >= codexOnUseRefreshStaleAfter {
+		return codexOnUseRefreshSoft
+	}
+	return codexOnUseRefreshNone
+}
+
+func codexColdKeepaliveEligible(a *Auth, now time.Time) bool {
+	if a == nil || !isCodexProvider(a.Provider) || a.Disabled || isAPIKeyAuth(a) {
+		return false
+	}
+	if authWide401Quarantine(a) != auth401KindNone {
+		return false
+	}
+	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
+		return false
+	}
+	if !a.NextRetryAfter.IsZero() && now.Before(a.NextRetryAfter) {
+		return false
+	}
+	return true
+}
+
+type codexColdKeepaliveCandidate struct {
+	id           string
+	lastActivity time.Time
+}
+
+func codexColdKeepaliveBatchSize(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	size := (total + codexColdKeepaliveCoverageDivisor - 1) / codexColdKeepaliveCoverageDivisor
+	if size < 1 {
+		return 1
+	}
+	return size
+}
+
+func (m *Manager) selectCodexColdKeepaliveIDs(now time.Time) []string {
+	if m == nil || m.executorFor("codex") == nil {
+		return nil
+	}
+	snapshot := m.snapshotAuths()
+	candidates := make([]codexColdKeepaliveCandidate, 0, len(snapshot))
+	total := 0
+	for _, auth := range snapshot {
+		if !codexColdKeepaliveEligible(auth, now) {
+			continue
+		}
+		total++
+		lastActivity := authEffectiveRefreshActivity(auth)
+		if !lastActivity.IsZero() && now.Sub(lastActivity) < codexColdKeepaliveMinSpacing {
+			continue
+		}
+		candidates = append(candidates, codexColdKeepaliveCandidate{
+			id:           auth.ID,
+			lastActivity: lastActivity,
+		})
+	}
+	if total == 0 || len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left := candidates[i].lastActivity
+		right := candidates[j].lastActivity
+		switch {
+		case left.IsZero() && right.IsZero():
+			return candidates[i].id < candidates[j].id
+		case left.IsZero():
+			return true
+		case right.IsZero():
+			return false
+		case !left.Equal(right):
+			return left.Before(right)
+		default:
+			return candidates[i].id < candidates[j].id
+		}
+	})
+	limit := codexColdKeepaliveBatchSize(total)
+	if limit > len(candidates) {
+		limit = len(candidates)
+	}
+	ids := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		ids = append(ids, candidates[i].id)
+	}
+	return ids
+}
+
+func (m *Manager) runCodexColdKeepalive(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	delay := time.Duration(0)
+	if codexColdKeepaliveInitialJitter > 0 {
+		delay = time.Duration(time.Now().UnixNano() % int64(codexColdKeepaliveInitialJitter))
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			m.runCodexColdKeepaliveOnce(ctx)
+			timer.Reset(codexColdKeepaliveInterval)
+		}
+	}
+}
+
+func (m *Manager) runCodexColdKeepaliveOnce(ctx context.Context) {
+	now := time.Now()
+	for _, id := range m.selectCodexColdKeepaliveIDs(now) {
+		if !m.markRefreshPending(id, now) {
+			continue
+		}
+		go m.refreshAuthWithLimit(ctx, id)
+	}
+}
+
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil || a.Disabled {
 		return false
@@ -2978,6 +3200,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	}
 	if kind := authWide401Quarantine(a); kind != auth401KindNone {
 		return kind == auth401KindTokenInvalidated
+	}
+	if isCodexProvider(a.Provider) {
+		return false
 	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return evaluator.ShouldRefresh(now, a)
@@ -3178,21 +3403,67 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 }
 
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
+	_, ok := m.markRefreshPendingAt(id, now)
+	return ok
+}
+
+func (m *Manager) markRefreshPendingAt(id string, now time.Time) (time.Time, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil || auth.Disabled {
-		return false
+		return time.Time{}, false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
-		return false
+		return time.Time{}, false
 	}
-	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
+	pendingUntil := now.Add(refreshPendingBackoff)
+	auth.NextRefreshAfter = pendingUntil
 	m.auths[id] = auth
-	return true
+	return pendingUntil, true
+}
+
+func (m *Manager) clearRefreshPending(id string, pendingUntil time.Time) {
+	if pendingUntil.IsZero() {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	auth, ok := m.auths[id]
+	if !ok || auth == nil {
+		return
+	}
+	if auth.NextRefreshAfter.Equal(pendingUntil) {
+		auth.NextRefreshAfter = time.Time{}
+		m.auths[id] = auth
+	}
 }
 
 func (m *Manager) refreshAuth(ctx context.Context, id string) {
+	_, _ = m.refreshAuthSync(ctx, id)
+}
+
+func (m *Manager) tryRefreshAuthSyncWithLimit(ctx context.Context, id string) (*Auth, error, bool) {
+	if m.refreshSemaphore == nil {
+		updated, err := m.refreshAuthSync(ctx, id)
+		return updated, err, true
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err(), false
+	default:
+	}
+	select {
+	case m.refreshSemaphore <- struct{}{}:
+		defer func() { <-m.refreshSemaphore }()
+		updated, err := m.refreshAuthSync(ctx, id)
+		return updated, err, true
+	default:
+		return nil, nil, false
+	}
+}
+
+func (m *Manager) refreshAuthSync(ctx context.Context, id string) (*Auth, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -3204,56 +3475,19 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
-		return
+		return nil, nil
 	}
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		return
+		return nil, err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
-		refreshErr := resultErrorFromExecutionError(err)
-		var authSnapshot *Auth
-		m.mu.Lock()
-		if current := m.auths[id]; current != nil {
-			switch authWide401Quarantine(current) {
-			case auth401KindTokenInvalidated:
-				if auth401QuarantineKind(refreshErr) != auth401KindAccountDeactivated {
-					if refreshErr == nil {
-						refreshErr = &Error{Message: err.Error()}
-					}
-					refreshErr.Code = auth401KindTokenInvalidated
-				}
-				applyAuthFailureState(current, refreshErr, nil, now)
-			default:
-				if auth401QuarantineKind(refreshErr) != auth401KindNone {
-					applyAuthFailureState(current, refreshErr, nil, now)
-				} else {
-					current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-					current.LastError = normalize401Error(refreshErr)
-					if current.LastError == nil {
-						current.LastError = &Error{Message: err.Error()}
-					}
-					current.Status = StatusError
-					current.StatusMessage = current.LastError.Message
-					current.UpdatedAt = now
-				}
-			}
-			m.auths[id] = current
-			authSnapshot = current.Clone()
-			if m.scheduler != nil {
-				m.scheduler.upsertAuth(authSnapshot)
-			}
-		}
-		m.mu.Unlock()
-		if authSnapshot != nil {
-			m.reconcileAffinityAuthState(authSnapshot)
-			_ = m.persist(ctx, authSnapshot)
-		}
-		return
+		m.applyRefreshFailure(ctx, id, err, now)
+		return nil, err
 	}
 	if updated == nil {
 		updated = cloned
@@ -3266,7 +3500,243 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.ModelStates = auth.ModelStates
 	updated.LastRefreshedAt = now
 	clearAuthStateAfterSuccessfulRefresh(updated, now)
-	_, _ = m.Update(ctx, updated)
+	saved, errUpdate := m.Update(ctx, updated)
+	if errUpdate != nil {
+		return nil, errUpdate
+	}
+	if saved == nil {
+		return updated.Clone(), nil
+	}
+	return saved, nil
+}
+
+func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExecErr error, now time.Time) {
+	refreshErr := resultErrorFromExecutionError(refreshExecErr)
+	var authSnapshot *Auth
+	m.mu.Lock()
+	if current := m.auths[id]; current != nil {
+		if current.Metadata == nil {
+			current.Metadata = make(map[string]any)
+		}
+		current.Metadata["last_refresh_attempt_at"] = now.UTC().Format(time.RFC3339Nano)
+		switch authWide401Quarantine(current) {
+		case auth401KindTokenInvalidated:
+			if auth401QuarantineKind(refreshErr) != auth401KindAccountDeactivated {
+				if refreshErr == nil {
+					refreshErr = &Error{Message: refreshExecErr.Error()}
+				}
+				refreshErr.Code = auth401KindTokenInvalidated
+			}
+			applyAuthFailureState(current, refreshErr, nil, now)
+		default:
+			if auth401QuarantineKind(refreshErr) != auth401KindNone {
+				applyAuthFailureState(current, refreshErr, nil, now)
+			} else {
+				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+				current.LastError = normalize401Error(refreshErr)
+				if current.LastError == nil {
+					current.LastError = &Error{Message: refreshExecErr.Error()}
+				}
+				current.Status = StatusError
+				current.StatusMessage = current.LastError.Message
+				current.UpdatedAt = now
+			}
+		}
+		m.auths[id] = current
+		authSnapshot = current.Clone()
+		if m.scheduler != nil {
+			m.scheduler.upsertAuth(authSnapshot)
+		}
+	}
+	m.mu.Unlock()
+	if authSnapshot != nil {
+		m.reconcileAffinityAuthState(authSnapshot)
+		_ = m.persist(ctx, authSnapshot)
+	}
+}
+
+func codexRefreshFailureRequiresSkip(mode codexOnUseRefreshMode, err error) bool {
+	if mode == codexOnUseRefreshHard {
+		return true
+	}
+	refreshErr := resultErrorFromExecutionError(err)
+	switch auth401QuarantineKind(refreshErr) {
+	case auth401KindTokenInvalidated, auth401KindAccountDeactivated:
+		return true
+	default:
+		return false
+	}
+}
+
+func codexRefreshBackoffError() *Error {
+	return &Error{
+		Code:      "auth_refresh_backoff",
+		Message:   "codex auth refresh is cooling down",
+		Retryable: true,
+	}
+}
+
+func codexQuarantineError(auth *Auth) error {
+	if auth == nil {
+		return nil
+	}
+	switch authWide401Quarantine(auth) {
+	case auth401KindNone:
+		return nil
+	case auth401KindTokenInvalidated, auth401KindAccountDeactivated:
+		if auth.LastError != nil {
+			return auth.LastError
+		}
+		return &Error{
+			Code:      authWide401Quarantine(auth),
+			Message:   authWide401Quarantine(auth),
+			Retryable: false,
+		}
+	default:
+		return nil
+	}
+}
+
+func codexRefreshMissingAuthError() *Error {
+	return &Error{
+		Code:      "auth_not_found",
+		Message:   "auth unavailable after refresh",
+		Retryable: true,
+	}
+}
+
+func (m *Manager) currentAuthSnapshot(id string) (*Auth, bool) {
+	if m == nil || strings.TrimSpace(id) == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	auth := m.auths[id]
+	var snapshot *Auth
+	if auth != nil {
+		snapshot = auth.Clone()
+	}
+	m.mu.RUnlock()
+	if snapshot == nil {
+		return nil, false
+	}
+	return snapshot, true
+}
+
+func (m *Manager) prepareAuthForExecution(ctx context.Context, auth *Auth) (*Auth, error) {
+	now := time.Now()
+	mode := codexOnUseRefreshModeForAuth(auth, now)
+	switch mode {
+	case codexOnUseRefreshNone:
+		return auth, nil
+	case codexOnUseRefreshSoft:
+		return m.prepareCodexAuthForSoftRefresh(ctx, auth)
+	case codexOnUseRefreshHard:
+		return m.prepareCodexAuthForHardRefresh(ctx, auth)
+	default:
+		return auth, nil
+	}
+}
+
+func (m *Manager) prepareCodexAuthForSoftRefresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	now := time.Now()
+	pendingUntil, ok := m.markRefreshPendingAt(auth.ID, now)
+	if !ok {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, errCtx
+		}
+		return auth, nil
+	}
+	updated, err, attempted := m.tryRefreshAuthSyncWithLimit(ctx, auth.ID)
+	if !attempted {
+		m.clearRefreshPending(auth.ID, pendingUntil)
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, errCtx
+		}
+		return auth, nil
+	}
+	if err != nil {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, errCtx
+		}
+		if codexRefreshFailureRequiresSkip(codexOnUseRefreshSoft, err) {
+			return nil, err
+		}
+		return auth, nil
+	}
+	if updated == nil {
+		return auth, nil
+	}
+	return updated, nil
+}
+
+func (m *Manager) prepareCodexAuthForHardRefresh(ctx context.Context, auth *Auth) (*Auth, error) {
+	deadline := time.Now().Add(codexHardRefreshWaitTimeout)
+	for {
+		if errCtx := ctx.Err(); errCtx != nil {
+			return nil, errCtx
+		}
+		current, ok := m.currentAuthSnapshot(auth.ID)
+		if !ok || current == nil {
+			return nil, codexRefreshMissingAuthError()
+		}
+		if quarantineErr := codexQuarantineError(current); quarantineErr != nil {
+			return nil, quarantineErr
+		}
+		if codexOnUseRefreshModeForAuth(current, time.Now()) != codexOnUseRefreshHard {
+			return current, nil
+		}
+
+		pendingUntil, acquired := m.markRefreshPendingAt(current.ID, time.Now())
+		if acquired {
+			updated, err, attempted := m.tryRefreshAuthSyncWithLimit(ctx, current.ID)
+			if !attempted {
+				m.clearRefreshPending(current.ID, pendingUntil)
+				if errCtx := ctx.Err(); errCtx != nil {
+					return nil, errCtx
+				}
+			} else {
+				if err != nil {
+					if errCtx := ctx.Err(); errCtx != nil {
+						return nil, errCtx
+					}
+					return nil, err
+				}
+				if updated != nil {
+					return updated, nil
+				}
+				return nil, codexRefreshMissingAuthError()
+			}
+		}
+
+		if time.Now().After(deadline) {
+			break
+		}
+		wait := codexHardRefreshPollInterval
+		if remaining := time.Until(deadline); remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			break
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	current, ok := m.currentAuthSnapshot(auth.ID)
+	if ok && current != nil {
+		if quarantineErr := codexQuarantineError(current); quarantineErr != nil {
+			return nil, quarantineErr
+		}
+		if codexOnUseRefreshModeForAuth(current, time.Now()) != codexOnUseRefreshHard {
+			return current, nil
+		}
+	}
+	return nil, codexRefreshBackoffError()
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
