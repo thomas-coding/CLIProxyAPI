@@ -292,6 +292,9 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
 			continue
 		}
+		if isIgnoredManagedAuthPath(path, s.authDir) {
+			continue
+		}
 		metadata := make(map[string]any)
 		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
 			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
@@ -364,12 +367,18 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 		if trimmed == "" {
 			continue
 		}
+		if isIgnoredManagedAuthPath(trimmed, s.authDir) {
+			continue
+		}
 		relID, err := s.relativeAuthID(trimmed)
 		if err != nil {
 			// Attempt to resolve absolute path under authDir.
 			abs := trimmed
 			if !filepath.IsAbs(abs) {
 				abs = filepath.Join(s.authDir, trimmed)
+			}
+			if isIgnoredManagedAuthPath(abs, s.authDir) {
+				continue
 			}
 			relID, err = s.relativeAuthID(abs)
 			if err != nil {
@@ -451,11 +460,8 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 	}
 	defer rows.Close()
 
-	if err = os.RemoveAll(s.authDir); err != nil {
+	if err = clearManagedAuthMirrorDir(s.authDir); err != nil {
 		return fmt.Errorf("postgres store: reset auth directory: %w", err)
-	}
-	if err = os.MkdirAll(s.authDir, 0o700); err != nil {
-		return fmt.Errorf("postgres store: recreate auth directory: %w", err)
 	}
 
 	for rows.Next() {
@@ -469,6 +475,9 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 		path, errPath := s.absoluteAuthPath(id)
 		if errPath != nil {
 			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
+			continue
+		}
+		if isIgnoredManagedAuthPath(path, s.authDir) {
 			continue
 		}
 		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

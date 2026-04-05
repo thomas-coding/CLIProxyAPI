@@ -313,16 +313,7 @@ func (s *GitTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error) {
 		return nil, fmt.Errorf("auth filestore: directory not configured")
 	}
 	entries := make([]*cliproxyauth.Auth, 0)
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
-			return nil
-		}
+	err := walkManagedAuthFiles(dir, func(path string, d fs.DirEntry) error {
 		auth, err := s.readAuthFile(path, dir)
 		if err != nil {
 			return nil
@@ -385,6 +376,9 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	for _, p := range paths {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
+			continue
+		}
+		if isIgnoredManagedAuthPath(trimmed, s.baseDirSnapshot()) {
 			continue
 		}
 		rel, err := s.relativeToRepo(trimmed)

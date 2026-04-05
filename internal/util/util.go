@@ -20,6 +20,7 @@ var functionNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_.:-]`)
 
 var ignoredAuthDirNames = map[string]struct{}{
 	"deleted-auth-backup": {},
+	"reserve-pool":        {},
 }
 
 // SanitizeFunctionName ensures a function name matches the requirements for Gemini/Vertex AI.

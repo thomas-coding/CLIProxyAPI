@@ -41,6 +41,9 @@ type Config struct {
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
+	// ReservePool configures the isolated reserve Codex auth pool sidecar.
+	ReservePool ReservePoolConfig `yaml:"reserve-pool" json:"reserve-pool"`
+
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 

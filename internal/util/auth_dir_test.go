@@ -9,6 +9,9 @@ func TestIsIgnoredAuthDirName(t *testing.T) {
 	if !IsIgnoredAuthDirName(" deleted-auth-backup ") {
 		t.Fatal("expected deleted-auth-backup to be ignored")
 	}
+	if !IsIgnoredAuthDirName(" reserve-pool ") {
+		t.Fatal("expected reserve-pool to be ignored")
+	}
 	if IsIgnoredAuthDirName("active") {
 		t.Fatal("did not expect active to be ignored")
 	}
@@ -35,6 +38,11 @@ func TestIsIgnoredAuthPath(t *testing.T) {
 		{
 			name: "nested backup subdirectory file",
 			path: filepath.Join(authDir, "nested", "deleted-auth-backup", "active.json"),
+			want: true,
+		},
+		{
+			name: "reserve pool subdirectory file",
+			path: filepath.Join(authDir, "reserve-pool", "active.json"),
 			want: true,
 		},
 		{

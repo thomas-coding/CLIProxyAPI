@@ -240,16 +240,7 @@ func (s *ObjectTokenStore) List(_ context.Context) ([]*cliproxyauth.Auth, error)
 		return nil, fmt.Errorf("object store: auth directory not configured")
 	}
 	entries := make([]*cliproxyauth.Auth, 0, 32)
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
-			return nil
-		}
+	err := walkManagedAuthFiles(dir, func(path string, d fs.DirEntry) error {
 		auth, err := s.readAuthFile(path, dir)
 		if err != nil {
 			log.WithError(err).Warnf("object store: skip auth %s", path)
@@ -306,6 +297,9 @@ func (s *ObjectTokenStore) PersistAuthFiles(ctx context.Context, _ string, paths
 		abs := trimmed
 		if !filepath.IsAbs(abs) {
 			abs = filepath.Join(s.authDir, trimmed)
+		}
+		if isIgnoredManagedAuthPath(abs, s.authDir) {
+			continue
 		}
 		if err := s.uploadAuth(ctx, abs); err != nil {
 			return err
@@ -426,6 +420,9 @@ func (s *ObjectTokenStore) syncAuthFromBucket(ctx context.Context) error {
 			continue
 		}
 		local := filepath.Join(s.authDir, cleanRel)
+		if isIgnoredManagedAuthPath(local, s.authDir) {
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
 			return fmt.Errorf("object store: prepare auth subdir: %w", err)
 		}
@@ -449,6 +446,9 @@ func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {
 	if path == "" {
 		return nil
 	}
+	if isIgnoredManagedAuthPath(path, s.authDir) {
+		return nil
+	}
 	rel, err := filepath.Rel(s.authDir, path)
 	if err != nil {
 		return fmt.Errorf("object store: resolve auth relative path: %w", err)
@@ -469,6 +469,9 @@ func (s *ObjectTokenStore) uploadAuth(ctx context.Context, path string) error {
 
 func (s *ObjectTokenStore) deleteAuthObject(ctx context.Context, path string) error {
 	if path == "" {
+		return nil
+	}
+	if isIgnoredManagedAuthPath(path, s.authDir) {
 		return nil
 	}
 	rel, err := filepath.Rel(s.authDir, path)

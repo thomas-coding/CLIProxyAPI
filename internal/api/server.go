@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/reservepool"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -157,6 +158,8 @@ type Server struct {
 
 	// management handler
 	mgmt *managementHandlers.Handler
+	// reserve pool sidecar
+	reservePool *reservepool.Manager
 
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
@@ -263,6 +266,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.reservePool = reservepool.NewManager(cfg, authManager)
+	s.mgmt.SetReservePool(s.reservePool)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -623,9 +628,13 @@ func (s *Server) registerManagementRoutes() {
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
+		mgmt.GET("/reserve-auth-files", s.mgmt.ListReserveAuthFiles)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
+		mgmt.GET("/reserve-auth-files/download", s.mgmt.DownloadReserveAuthFile)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
+		mgmt.POST("/reserve-auth-files", s.mgmt.UploadReserveAuthFile)
+		mgmt.POST("/reserve-auth-files/refresh", s.mgmt.RefreshReserveAuthFiles)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
@@ -794,6 +803,9 @@ func (s *Server) Start() error {
 	if s == nil || s.server == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
+	if s.reservePool != nil {
+		s.reservePool.Start()
+	}
 
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
@@ -832,6 +844,12 @@ func (s *Server) Stop(ctx context.Context) error {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
+		}
+	}
+
+	if s.reservePool != nil {
+		if err := s.reservePool.Stop(ctx); err != nil {
+			return fmt.Errorf("failed to stop reserve pool: %v", err)
 		}
 	}
 
@@ -975,6 +993,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+		s.mgmt.SetReservePool(s.reservePool)
+	}
+	if s.reservePool != nil {
+		s.reservePool.UpdateConfig(cfg, s.handlers.AuthManager)
 	}
 
 	// Notify Amp module only when Amp config has changed.
