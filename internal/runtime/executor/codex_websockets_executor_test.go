@@ -55,7 +55,7 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 }
 
-func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
+func TestApplyCodexWebsocketHeadersUsesBoundUserAgentAndConfigBetaFeaturesForOAuth(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "my-codex-client/1.0",
@@ -72,8 +72,9 @@ func TestApplyCodexWebsocketHeadersUsesConfigDefaultsForOAuth(t *testing.T) {
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "my-codex-client/1.0" {
-		t.Fatalf("User-Agent = %s, want %s", got, "my-codex-client/1.0")
+	expectedUA := codexBoundFallbackUserAgent(context.Background(), auth)
+	if got := headers.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %s, want %s", got, expectedUA)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "feature-a,feature-b" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "feature-a,feature-b")
@@ -112,7 +113,7 @@ func TestApplyCodexWebsocketHeadersPrefersExistingHeadersOverClientAndConfig(t *
 	}
 }
 
-func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testing.T) {
+func TestApplyCodexWebsocketHeadersPrefersClientUserAgentOverConfig(t *testing.T) {
 	cfg := &config.Config{
 		CodexHeaderDefaults: config.CodexHeaderDefaults{
 			UserAgent:    "config-ua",
@@ -130,8 +131,8 @@ func TestApplyCodexWebsocketHeadersConfigUserAgentOverridesClientHeader(t *testi
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", cfg)
 
-	if got := headers.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+	if got := headers.Get("User-Agent"); got != "client-ua" {
+		t.Fatalf("User-Agent = %s, want %s", got, "client-ua")
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "client-beta" {
 		t.Fatalf("x-codex-beta-features = %s, want %s", got, "client-beta")
@@ -163,7 +164,7 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 	}
 }
 
-func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
+func TestApplyCodexHeadersPrefersClientUserAgentForOAuth(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
 		t.Fatalf("NewRequest() error = %v", err)
@@ -184,8 +185,8 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 
 	applyCodexHeaders(req, auth, "oauth-token", true, cfg)
 
-	if got := req.Header.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %s, want %s", got, "config-ua")
+	if got := req.Header.Get("User-Agent"); got != "client-ua" {
+		t.Fatalf("User-Agent = %s, want %s", got, "client-ua")
 	}
 	if got := req.Header.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
@@ -201,6 +202,30 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Gateway-Id"); got != "" {
 		t.Fatalf("X-Gateway-Id = %q, want empty", got)
+	}
+}
+
+func TestApplyCodexHeadersIgnoresInternalHopClientUserAgentWithoutSnapshot(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-hop",
+		Provider: "codex",
+		Metadata: map[string]any{"email": "user@example.com"},
+	}
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent":           "Go-http-client/1.1",
+		codexAffinityKeyHeader: "user:hop-client",
+	})
+	req = req.WithContext(ctx)
+
+	applyCodexHeaders(req, auth, "oauth-token", true, &config.Config{})
+
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := req.Header.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %s, want %s", got, expectedUA)
 	}
 }
 

@@ -540,7 +540,7 @@ func TestCodexExecutorExecute_TransparentOnPrefersClientSnapshotHeadersAndQuery(
 	}
 }
 
-func TestCodexExecutorExecute_TransparentOnFallsBackToConfiguredUserAgent(t *testing.T) {
+func TestCodexExecutorExecute_TransparentOnIgnoresConfiguredUserAgentAndFallsBackToBoundUserAgent(t *testing.T) {
 	var seenHeaders http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenHeaders = r.Header.Clone()
@@ -583,8 +583,9 @@ func TestCodexExecutorExecute_TransparentOnFallsBackToConfiguredUserAgent(t *tes
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	if got := seenHeaders.Get("User-Agent"); got != "config-ua" {
-		t.Fatalf("User-Agent = %q, want %q", got, "config-ua")
+	expectedUA := codexBoundFallbackUserAgent(context.Background(), auth)
+	if got := seenHeaders.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
 	}
 	if got := seenHeaders.Get("Version"); got != "" {
 		t.Fatalf("Version = %q, want empty when client did not send it", got)

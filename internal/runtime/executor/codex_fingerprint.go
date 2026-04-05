@@ -13,14 +13,16 @@ import (
 const codexAffinityKeyHeader = "X-Arroute-Affinity-Key"
 
 var codexFallbackUserAgentPool = []string{
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.154 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.80 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.67 Safari/537.36",
-	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.127 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.66 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.138 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.7258.66 Safari/537.36",
-	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.80 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.165 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.154 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.160 Safari/537.36",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.164 Safari/537.36",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.153 Safari/537.36",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.159 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:148.0) Gecko/20100101 Firefox/148.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0",
+	"Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+	"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0",
 }
 
 func ensureCodexUserAgent(target, source http.Header, ctx context.Context, auth *cliproxyauth.Auth, cfg *config.Config) {
@@ -28,6 +30,10 @@ func ensureCodexUserAgent(target, source http.Header, ctx context.Context, auth 
 		return
 	}
 	currentUA := strings.TrimSpace(target.Get("User-Agent"))
+	if looksLikeInternalHopUserAgent(currentUA) {
+		target.Del("User-Agent")
+		currentUA = ""
+	}
 	snapshotUA, snapshotPresent := codexSnapshotUserAgentFromContext(ctx)
 	if snapshotPresent {
 		if snapshotUA != "" {
@@ -40,11 +46,6 @@ func ensureCodexUserAgent(target, source http.Header, ctx context.Context, auth 
 		}
 	}
 	if currentUA != "" {
-		return
-	}
-	cfgUserAgent, _ := codexHeaderDefaults(cfg, auth)
-	if cfgUserAgent = strings.TrimSpace(cfgUserAgent); cfgUserAgent != "" {
-		target.Set("User-Agent", cfgUserAgent)
 		return
 	}
 	if sourceUA := codexSourceUserAgent(ctx, source); sourceUA != "" {
@@ -66,7 +67,11 @@ func codexSourceUserAgent(ctx context.Context, source http.Header) string {
 	if source == nil {
 		return ""
 	}
-	return strings.TrimSpace(source.Get("User-Agent"))
+	sourceUA := strings.TrimSpace(source.Get("User-Agent"))
+	if looksLikeInternalHopUserAgent(sourceUA) {
+		return ""
+	}
+	return sourceUA
 }
 
 func codexSnapshotUserAgentFromContext(ctx context.Context) (string, bool) {

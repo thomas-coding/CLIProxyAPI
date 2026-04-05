@@ -83,3 +83,45 @@ func TestEnsureCodexUserAgentSnapshotWithoutUAKeepsNonInternalCurrentUA(t *testi
 		t.Fatalf("User-Agent = %q, want %q", got, "custom-direct-ua")
 	}
 }
+
+func TestEnsureCodexUserAgentIgnoresConfiguredUserAgentAndFallsBackToBoundUA(t *testing.T) {
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		codexAffinityKeyHeader: "user:cfg-ignored",
+	})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-1",
+		Provider: "codex",
+	}
+	target := http.Header{}
+
+	ensureCodexUserAgent(target, nil, ctx, auth, &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent: "config-ua",
+		},
+	})
+
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := target.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
+	}
+}
+
+func TestEnsureCodexUserAgentIgnoresInternalHopSourceUserAgentWithoutSnapshot(t *testing.T) {
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		codexAffinityKeyHeader: "user:no-snapshot-internal-hop",
+	})
+	auth := &cliproxyauth.Auth{
+		ID:       "auth-2",
+		Provider: "codex",
+	}
+	target := http.Header{}
+	source := http.Header{}
+	source.Set("User-Agent", "Go-http-client/1.1")
+
+	ensureCodexUserAgent(target, source, ctx, auth, &config.Config{})
+
+	expectedUA := codexBoundFallbackUserAgent(ctx, auth)
+	if got := target.Get("User-Agent"); got != expectedUA {
+		t.Fatalf("User-Agent = %q, want %q", got, expectedUA)
+	}
+}
