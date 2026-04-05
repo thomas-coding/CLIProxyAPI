@@ -274,8 +274,8 @@ func TestCodexExecutorExecute_TransparentOnPreservesClientShape(t *testing.T) {
 	if gjson.GetBytes(seenBody, "stream").Type != gjson.False {
 		t.Fatalf("transparent upstream must preserve stream=false, got %s", gjson.GetBytes(seenBody, "stream").Raw)
 	}
-	if gjson.GetBytes(seenBody, "store").Type != gjson.True {
-		t.Fatalf("transparent upstream must preserve store=true, got %s", gjson.GetBytes(seenBody, "store").Raw)
+	if gjson.GetBytes(seenBody, "store").Type != gjson.False {
+		t.Fatalf("transparent upstream must still force store=false, got %s", gjson.GetBytes(seenBody, "store").Raw)
 	}
 	if got := gjson.GetBytes(seenBody, "previous_response_id").String(); got != "resp-prev" {
 		t.Fatalf("previous_response_id = %q, want %q", got, "resp-prev")
@@ -365,6 +365,56 @@ func TestCodexExecutorExecute_TransparentOnPreservesClientShape(t *testing.T) {
 
 	if got := strings.TrimSpace(string(resp.Payload)); got != `{"id":"resp_2","object":"response","status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}` {
 		t.Fatalf("response payload = %s", got)
+	}
+}
+
+func TestCodexExecutorExecute_TransparentOnInjectsStoreFalseWhenMissing(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		seenBody = body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_store_missing","object":"response","status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			CodexRelay: config.CodexRelayConfig{TransparentMode: "on"},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+			"account_id":   "acct-123",
+		},
+	}
+	body := []byte(`{"model":"alias-model","stream":true,"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+
+	_, err := executor.Execute(
+		contextWithGinRequest("/v1/responses", map[string]string{
+			"Accept": "text/event-stream",
+		}),
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5.4", Payload: body},
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: body,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(seenBody, "store").Type; got != gjson.False {
+		t.Fatalf("transparent upstream must inject store=false when missing, got %s body=%s", gjson.GetBytes(seenBody, "store").Raw, string(seenBody))
 	}
 }
 

@@ -296,6 +296,10 @@ func (e *CodexExecutor) buildTransparentCodexRequest(ctx context.Context, auth *
 			return codexPreparedRequest{}, fmt.Errorf("codex transparent relay: rewrite model: %w", err)
 		}
 	}
+	body, err = applyTransparentCodexBodyCompatibility(body)
+	if err != nil {
+		return codexPreparedRequest{}, fmt.Errorf("codex transparent relay: apply compatibility overrides: %w", err)
+	}
 
 	url := codexTransparentRequestURL(baseURL, kind, snapshot.rawQuery)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
@@ -309,6 +313,20 @@ func (e *CodexExecutor) buildTransparentCodexRequest(ctx context.Context, auth *
 		originalPayload: originalPayload,
 		transparent:     true,
 	}, nil
+}
+
+func applyTransparentCodexBodyCompatibility(body []byte) ([]byte, error) {
+	if gjson.GetBytes(body, "store").Type == gjson.False {
+		return body, nil
+	}
+
+	// Transparent relay keeps the client request shape where possible, but Codex
+	// /responses still requires an explicit store=false.
+	updated, err := sjson.SetBytes(body, "store", false)
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 func applyTransparentCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, cfg *config.Config, stream bool, snapshotHeaders http.Header) {
