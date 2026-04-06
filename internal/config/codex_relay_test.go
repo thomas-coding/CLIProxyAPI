@@ -12,6 +12,7 @@ func TestLoadConfigOptional_CodexRelayTransparentMode(t *testing.T) {
 	configYAML := []byte(`
 codex-relay:
   transparent-mode: "  SHADOW  "
+  http-responses-legacy-shaping: true
 `)
 	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
 		t.Fatalf("failed to write config: %v", err)
@@ -24,6 +25,9 @@ codex-relay:
 
 	if got := cfg.CodexRelay.TransparentMode; got != "shadow" {
 		t.Fatalf("TransparentMode = %q, want %q", got, "shadow")
+	}
+	if !cfg.CodexRelay.HTTPResponsesLegacyShaping {
+		t.Fatal("HTTPResponsesLegacyShaping = false, want true")
 	}
 }
 

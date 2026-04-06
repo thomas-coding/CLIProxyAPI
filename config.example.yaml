@@ -113,6 +113,7 @@ nonstream-keepalive-interval: 0
 # Keep this rollback-safe by starting with shadow, then switch to on after log review.
 # codex-relay:
 #   transparent-mode: "off" # off | shadow | on
+#   http-responses-legacy-shaping: false # keep HTTP /v1/responses on legacy shaping while transparent HTTP semantics are not ready
 
 # Optional lease-based user affinity routing.
 # Recommended first rollout is shadow-mode only.

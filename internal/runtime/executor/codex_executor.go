@@ -192,7 +192,7 @@ func (e *CodexExecutor) configuredTransparentMode() codexTransparentMode {
 	}
 }
 
-func (e *CodexExecutor) effectiveTransparentMode(from sdktranslator.Format, originalPayload []byte) codexTransparentMode {
+func (e *CodexExecutor) effectiveTransparentMode(ctx context.Context, from sdktranslator.Format, originalPayload []byte, kind codexRequestKind) codexTransparentMode {
 	mode := e.configuredTransparentMode()
 	if mode == codexTransparentModeOff {
 		return codexTransparentModeOff
@@ -203,7 +203,24 @@ func (e *CodexExecutor) effectiveTransparentMode(from sdktranslator.Format, orig
 	if len(originalPayload) == 0 {
 		return codexTransparentModeOff
 	}
+	if e.shouldForceLegacyHTTPResponses(ctx, kind) {
+		return codexTransparentModeOff
+	}
 	return mode
+}
+
+func (e *CodexExecutor) shouldForceLegacyHTTPResponses(ctx context.Context, kind codexRequestKind) bool {
+	if e == nil || e.cfg == nil || !e.cfg.CodexRelay.HTTPResponsesLegacyShaping {
+		return false
+	}
+	if kind == codexRequestKindResponsesCompact {
+		return false
+	}
+	ginCtx := ginContextFrom(ctx)
+	if ginCtx == nil || ginCtx.Request == nil || ginCtx.Request.URL == nil {
+		return false
+	}
+	return strings.TrimSpace(ginCtx.Request.URL.Path) == "/v1/responses"
 }
 
 func (e *CodexExecutor) prepareCodexRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, kind codexRequestKind, baseModel, baseURL, apiKey string, from, to sdktranslator.Format) (codexPreparedRequest, error) {
@@ -211,7 +228,7 @@ func (e *CodexExecutor) prepareCodexRequest(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return codexPreparedRequest{}, err
 	}
-	mode := e.effectiveTransparentMode(from, legacyPrepared.originalPayload)
+	mode := e.effectiveTransparentMode(ctx, from, legacyPrepared.originalPayload, kind)
 	if mode == codexTransparentModeOff {
 		return legacyPrepared, nil
 	}

@@ -63,6 +63,11 @@ type CodexRelayConfig struct {
 	//   - "shadow": keep legacy live traffic but compare it against transparent request building
 	//   - "on": send the transparent request upstream
 	TransparentMode string `yaml:"transparent-mode,omitempty" json:"transparent-mode,omitempty"`
+
+	// HTTPResponsesLegacyShaping forces the HTTP /v1/responses path to keep the
+	// legacy request builder even when transparent-mode is enabled. This leaves
+	// websocket and /v1/responses/compact behavior unchanged.
+	HTTPResponsesLegacyShaping bool `yaml:"http-responses-legacy-shaping,omitempty" json:"http-responses-legacy-shaping,omitempty"`
 }
 
 // AffinityConfig holds lease-based user affinity settings for auth selection.

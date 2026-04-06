@@ -418,6 +418,162 @@ func TestCodexExecutorExecute_TransparentOnInjectsStoreFalseWhenMissing(t *testi
 	}
 }
 
+func TestCodexExecutorExecute_TransparentOnHTTPResponsesLegacyShapingFlagForcesLegacyRequestShaping(t *testing.T) {
+	var seenBody []byte
+	var seenHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		seenBody = body
+		seenHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_rollback\",\"object\":\"response\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			CodexRelay: config.CodexRelayConfig{
+				TransparentMode:            "on",
+				HTTPResponsesLegacyShaping: true,
+			},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+			"account_id":   "acct-123",
+		},
+	}
+	body := []byte(`{"model":"alias-model","stream":false,"store":true,"previous_response_id":"resp-prev","prompt_cache_retention":{"policy":"keep"},"safety_identifier":"safe-1"}`)
+	ctx := contextWithGinRequest("/v1/responses", map[string]string{
+		"OpenAI-Beta":        "responses=experimental",
+		"Accept-Encoding":    "br",
+		"X-Stainless-Lang":   "js",
+		"X-Codex-Turn-State": "turn-state-1",
+	})
+
+	_, err := executor.Execute(
+		ctx,
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
+		cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: body,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if !gjson.GetBytes(seenBody, "stream").Bool() {
+		t.Fatalf("legacy-compatible rollback must force stream=true")
+	}
+	if gjson.GetBytes(seenBody, "previous_response_id").Exists() {
+		t.Fatalf("legacy-compatible rollback must drop previous_response_id")
+	}
+	if gjson.GetBytes(seenBody, "prompt_cache_retention").Exists() {
+		t.Fatalf("legacy-compatible rollback must drop prompt_cache_retention")
+	}
+	if !gjson.GetBytes(seenBody, "instructions").Exists() {
+		t.Fatalf("legacy-compatible rollback must add instructions placeholder")
+	}
+	if got := seenHeaders.Get("OpenAI-Beta"); got != "" {
+		t.Fatalf("OpenAI-Beta = %q, want empty after legacy rollback", got)
+	}
+	if got := seenHeaders.Get("Accept-Encoding"); got == "br" {
+		t.Fatalf("Accept-Encoding = %q, want legacy/default transport value instead of transparent snapshot", got)
+	}
+	if got := seenHeaders.Get("X-Stainless-Lang"); got != "" {
+		t.Fatalf("X-Stainless-Lang = %q, want empty after legacy rollback", got)
+	}
+	if got := seenHeaders.Get("X-Codex-Turn-State"); got != "" {
+		t.Fatalf("X-Codex-Turn-State = %q, want empty after legacy rollback", got)
+	}
+}
+
+func TestCodexExecutorExecute_TransparentOnHTTPResponsesLegacyShapingFlagKeepsCompactTransparent(t *testing.T) {
+	var seenBody []byte
+	var seenHeaders http.Header
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		seenBody = body
+		seenHeaders = r.Header.Clone()
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact_rollback","object":"response","status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{
+		SDKConfig: config.SDKConfig{
+			CodexRelay: config.CodexRelayConfig{
+				TransparentMode:            "on",
+				HTTPResponsesLegacyShaping: true,
+			},
+		},
+	})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Attributes: map[string]string{
+			"base_url": server.URL,
+		},
+		Metadata: map[string]any{
+			"access_token": "oauth-token",
+			"account_id":   "acct-123",
+		},
+	}
+	body := []byte(`{"model":"alias-model","store":true,"previous_response_id":"resp-prev","input":[]}`)
+	ctx := contextWithGinRequest("/v1/responses/compact", map[string]string{
+		"User-Agent":      "client-ua",
+		"OpenAI-Beta":     "responses=experimental",
+		"Accept-Encoding": "br",
+	})
+
+	resp, err := executor.Execute(
+		ctx,
+		auth,
+		cliproxyexecutor.Request{Model: "gpt-5", Payload: body},
+		cliproxyexecutor.Options{
+			Alt:             "responses/compact",
+			SourceFormat:    sdktranslator.FromString("openai-response"),
+			OriginalRequest: body,
+		},
+	)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := seenPath; got != "/responses/compact" {
+		t.Fatalf("path = %q, want %q", got, "/responses/compact")
+	}
+	if got := gjson.GetBytes(seenBody, "previous_response_id").String(); got != "resp-prev" {
+		t.Fatalf("previous_response_id = %q, want %q", got, "resp-prev")
+	}
+	if got := gjson.GetBytes(seenBody, "store").Type; got != gjson.False {
+		t.Fatalf("store = %s, want false", gjson.GetBytes(seenBody, "store").Raw)
+	}
+	if got := seenHeaders.Get("OpenAI-Beta"); got != "responses=experimental" {
+		t.Fatalf("OpenAI-Beta = %q, want %q", got, "responses=experimental")
+	}
+	if got := seenHeaders.Get("Accept-Encoding"); got != "br" {
+		t.Fatalf("Accept-Encoding = %q, want %q", got, "br")
+	}
+	if got := strings.TrimSpace(string(resp.Payload)); got != `{"id":"resp_compact_rollback","object":"response","status":"completed","model":"gpt-5","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}` {
+		t.Fatalf("response payload = %s", got)
+	}
+}
+
 func TestCodexExecutorExecute_TransparentOnPassthroughsArbitraryJSONSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
