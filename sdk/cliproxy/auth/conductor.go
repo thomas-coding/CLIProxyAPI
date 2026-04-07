@@ -1934,6 +1934,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
+	shouldArchiveAccountDeactivated := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -2062,11 +2063,33 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		if m.shouldArchiveAccountDeactivated(auth) {
+			authSnapshot = m.stageArchivedAuthRemovalLocked(auth)
+			shouldArchiveAccountDeactivated = authSnapshot != nil
+		} else {
+			authSnapshot = auth.Clone()
+			_ = m.persist(ctx, auth)
+		}
 	}
 	m.mu.Unlock()
-	if m.scheduler != nil && authSnapshot != nil {
+	archived := false
+	if shouldArchiveAccountDeactivated && authSnapshot != nil {
+		archiveResult, err := m.archiveAccountDeactivated(ctx, authSnapshot)
+		if err != nil {
+			log.WithError(err).Warnf("archive account_deactivated auth %s to external-401 failed", authSnapshot.ID)
+			m.restoreArchivedAuth(authSnapshot)
+			_ = m.persist(ctx, authSnapshot)
+		} else {
+			log.WithFields(log.Fields{
+				"auth_id":     authSnapshot.ID,
+				"source_path": archiveResult.SourcePath,
+				"target_path": archiveResult.TargetPath,
+			}).Warn("archived account_deactivated auth to external-401")
+			m.removeArchivedAuth(authSnapshot.ID)
+			archived = true
+		}
+	}
+	if !archived && m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
 
@@ -3513,6 +3536,7 @@ func (m *Manager) refreshAuthSync(ctx context.Context, id string) (*Auth, error)
 func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExecErr error, now time.Time) {
 	refreshErr := resultErrorFromExecutionError(refreshExecErr)
 	var authSnapshot *Auth
+	shouldArchiveAccountDeactivated := false
 	m.mu.Lock()
 	if current := m.auths[id]; current != nil {
 		if current.Metadata == nil {
@@ -3542,13 +3566,34 @@ func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExe
 				current.UpdatedAt = now
 			}
 		}
-		m.auths[id] = current
-		authSnapshot = current.Clone()
-		if m.scheduler != nil {
+		if m.shouldArchiveAccountDeactivated(current) {
+			authSnapshot = m.stageArchivedAuthRemovalLocked(current)
+			shouldArchiveAccountDeactivated = authSnapshot != nil
+		} else {
+			m.auths[id] = current
+			authSnapshot = current.Clone()
+		}
+		if !shouldArchiveAccountDeactivated && m.scheduler != nil {
 			m.scheduler.upsertAuth(authSnapshot)
 		}
 	}
 	m.mu.Unlock()
+	if shouldArchiveAccountDeactivated && authSnapshot != nil {
+		archiveResult, err := m.archiveAccountDeactivated(ctx, authSnapshot)
+		if err != nil {
+			log.WithError(err).Warnf("archive refresh-detected account_deactivated auth %s to external-401 failed", authSnapshot.ID)
+			m.restoreArchivedAuth(authSnapshot)
+			_ = m.persist(ctx, authSnapshot)
+			return
+		}
+		log.WithFields(log.Fields{
+			"auth_id":     authSnapshot.ID,
+			"source_path": archiveResult.SourcePath,
+			"target_path": archiveResult.TargetPath,
+		}).Warn("archived refresh-detected account_deactivated auth to external-401")
+		m.removeArchivedAuth(authSnapshot.ID)
+		return
+	}
 	if authSnapshot != nil {
 		m.reconcileAffinityAuthState(authSnapshot)
 		_ = m.persist(ctx, authSnapshot)

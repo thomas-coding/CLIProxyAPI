@@ -39,6 +39,11 @@ func (s *FileTokenStore) SetBaseDir(dir string) {
 	s.dirLock.Unlock()
 }
 
+// AuthDir returns the directory used for auth persistence.
+func (s *FileTokenStore) AuthDir() string {
+	return s.baseDirSnapshot()
+}
+
 // Save persists token storage and metadata to the resolved auth file path.
 func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {

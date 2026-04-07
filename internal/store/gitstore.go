@@ -400,6 +400,33 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	return s.commitAndPushLocked(message, filtered...)
 }
 
+// ArchiveAuthFile commits one managed auth removal together with its external-401 archive target.
+func (s *GitTokenStore) ArchiveAuthFile(_ context.Context, sourcePath, targetPath, message string) error {
+	if strings.TrimSpace(sourcePath) == "" || strings.TrimSpace(targetPath) == "" {
+		return fmt.Errorf("git token store: source and target paths are required")
+	}
+	if err := s.EnsureRepository(); err != nil {
+		return err
+	}
+
+	sourceRel, err := s.relativeToRepo(sourcePath)
+	if err != nil {
+		return err
+	}
+	targetRel, err := s.relativeToRepo(targetPath)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.TrimSpace(message) == "" {
+		message = "Archive account_deactivated auth"
+	}
+	return s.commitAndPushLocked(message, sourceRel, targetRel)
+}
+
 func (s *GitTokenStore) resolveDeletePath(id string) (string, error) {
 	if strings.ContainsRune(id, os.PathSeparator) || filepath.IsAbs(id) {
 		return id, nil
