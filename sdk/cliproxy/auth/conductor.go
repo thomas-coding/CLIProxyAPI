@@ -178,6 +178,9 @@ type Manager struct {
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
+	// quotaReentryEventLogPath stores the production 429 reentry event log path.
+	quotaReentryEventLogPath atomic.Value
+	quotaReentryEventMu      sync.Mutex
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
@@ -300,6 +303,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		m.affinity.reset()
 	}
 	m.runtimeConfig.Store(cfg)
+	m.SetQuotaReentryEventLogPath(defaultQuotaReentryEventLogPath(cfg))
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -1935,10 +1939,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	setModelQuota := false
 	var authSnapshot *Auth
 	shouldArchiveAccountDeactivated := false
+	var quotaReentryAttempt *quotaReentryAttempt
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		quotaReentryAttempt = detectQuotaReentryAttempt(auth, result.Model, now)
 		if result.Success {
 			if m.affinity != nil && !m.affinity.acceptsSuccess(m.currentConfig(), result) {
 				authSnapshot = auth.Clone()
@@ -2091,6 +2097,10 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	if !archived && m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
+	}
+
+	if quotaReentryAttempt != nil {
+		m.appendQuotaReentryEvent(quotaReentryAttempt, authSnapshot, result)
 	}
 
 	if clearModelQuota && result.Model != "" {
