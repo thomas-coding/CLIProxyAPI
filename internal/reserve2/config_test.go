@@ -44,6 +44,30 @@ func TestEnvConfigValidateAllowsReserve1UnderProductionDir(t *testing.T) {
 	}
 }
 
+func TestSampleTimeoutExpandsForSerialApply(t *testing.T) {
+	cfg := newValidEnvConfigForTest(t.TempDir())
+	cfg.SampleSize = 60
+	cfg.SampleCap = 80
+	cfg.SerialDelayMax = 15 * time.Second
+
+	got := cfg.SampleTimeout(true)
+	if got <= 10*time.Minute {
+		t.Fatalf("SampleTimeout(apply) = %s, want > 10m", got)
+	}
+}
+
+func TestSyncTimeoutExpandsForSerialApply(t *testing.T) {
+	cfg := newValidEnvConfigForTest(t.TempDir())
+	cfg.MaxTransfer = 150
+	cfg.CandidateFactor = 1.6
+	cfg.SerialDelayMax = 15 * time.Second
+
+	got := cfg.SyncTimeout(true)
+	if got <= 20*time.Minute {
+		t.Fatalf("SyncTimeout(apply) = %s, want > 20m", got)
+	}
+}
+
 func newValidEnvConfigForTest(root string) *EnvConfig {
 	return &EnvConfig{
 		ColdRoot:          filepath.Join(root, "cold"),
@@ -56,8 +80,11 @@ func newValidEnvConfigForTest(root string) *EnvConfig {
 		CandidateFactor:   1.6,
 		SampleSize:        20,
 		SampleCap:         30,
+		SelectionWindow:   1,
 		Cooldown429:       24 * time.Hour,
 		CooldownTransient: 30 * time.Minute,
+		SerialDelayMin:    0,
+		SerialDelayMax:    0,
 		Timezone:          "UTC",
 	}
 }

@@ -24,8 +24,11 @@ type EnvConfig struct {
 	CandidateFactor   float64
 	SampleSize        int
 	SampleCap         int
+	SelectionWindow   float64
 	Cooldown429       time.Duration
 	CooldownTransient time.Duration
+	SerialDelayMin    time.Duration
+	SerialDelayMax    time.Duration
 	Timezone          string
 }
 
@@ -45,8 +48,11 @@ func LoadEnvConfig(envPath string) (*EnvConfig, error) {
 		CandidateFactor:   parseEnvFloat(values, "CANDIDATE_FACTOR", 1.6),
 		SampleSize:        parseEnvInt(values, "SAMPLE_SIZE", 20),
 		SampleCap:         parseEnvInt(values, "SAMPLE_CAP", 30),
+		SelectionWindow:   parseEnvFloat(values, "SELECTION_WINDOW_FACTOR", 1),
 		Cooldown429:       parseEnvDuration(values, "COOLDOWN_429", 24*time.Hour),
 		CooldownTransient: parseEnvDuration(values, "COOLDOWN_TRANSIENT", 30*time.Minute),
+		SerialDelayMin:    parseEnvDuration(values, "SERIAL_DELAY_MIN", 0),
+		SerialDelayMax:    parseEnvDuration(values, "SERIAL_DELAY_MAX", 0),
 		Timezone:          strings.TrimSpace(values["TZ"]),
 	}
 	if cfg.Timezone == "" {
@@ -90,11 +96,20 @@ func (c *EnvConfig) Validate() error {
 	if c.SampleCap <= 0 {
 		return fmt.Errorf("SAMPLE_CAP must be > 0")
 	}
+	if c.SelectionWindow < 1 {
+		return fmt.Errorf("SELECTION_WINDOW_FACTOR must be >= 1")
+	}
 	if c.Cooldown429 <= 0 {
 		return fmt.Errorf("COOLDOWN_429 must be > 0")
 	}
 	if c.CooldownTransient <= 0 {
 		return fmt.Errorf("COOLDOWN_TRANSIENT must be > 0")
+	}
+	if c.SerialDelayMin < 0 {
+		return fmt.Errorf("SERIAL_DELAY_MIN must be >= 0")
+	}
+	if c.SerialDelayMax < c.SerialDelayMin {
+		return fmt.Errorf("SERIAL_DELAY_MAX must be >= SERIAL_DELAY_MIN")
 	}
 	if err := validateColdRootIsolation(c.ColdRoot, c.ProductionDir, "PRODUCTION_DIR"); err != nil {
 		return err
@@ -183,6 +198,54 @@ func (c *EnvConfig) CandidateCount(desiredTransfer int) int {
 	return count
 }
 
+func (c *EnvConfig) SelectionWindowCount(limit int) int {
+	if limit <= 0 {
+		return 0
+	}
+	count := int(math.Ceil(float64(limit) * c.SelectionWindow))
+	if count < limit {
+		count = limit
+	}
+	return count
+}
+
+func (c *EnvConfig) SampleTimeout(apply bool) time.Duration {
+	if !apply {
+		return 10 * time.Minute
+	}
+	sampleCount := minPositive(c.SampleSize, c.SampleCap)
+	if sampleCount <= 0 {
+		sampleCount = c.SampleSize
+	}
+	return boundedReserveTimeout(sampleCount, c.SerialDelayMax, 20*time.Minute, 4*time.Hour)
+}
+
+func (c *EnvConfig) SyncTimeout(apply bool) time.Duration {
+	if !apply {
+		return 20 * time.Minute
+	}
+	candidateCount := c.CandidateCount(c.MaxTransfer)
+	return boundedReserveTimeout(candidateCount, c.SerialDelayMax, 30*time.Minute, 6*time.Hour)
+}
+
+func boundedReserveTimeout(count int, serialDelayMax, minimum, maximum time.Duration) time.Duration {
+	if count <= 0 {
+		return minimum
+	}
+	perAuthBudget := 30*time.Second + serialDelayMax
+	if perAuthBudget < 30*time.Second {
+		perAuthBudget = 30 * time.Second
+	}
+	total := time.Duration(count)*perAuthBudget + 10*time.Minute
+	if total < minimum {
+		total = minimum
+	}
+	if total > maximum {
+		total = maximum
+	}
+	return total
+}
+
 func parseEnvInt(values map[string]string, key string, fallback int) int {
 	raw := strings.TrimSpace(values[key])
 	if raw == "" {
@@ -217,6 +280,19 @@ func parseEnvDuration(values map[string]string, key string, fallback time.Durati
 		return fallback
 	}
 	return parsed
+}
+
+func minPositive(left, right int) int {
+	switch {
+	case left <= 0:
+		return right
+	case right <= 0:
+		return left
+	case left < right:
+		return left
+	default:
+		return right
+	}
 }
 
 func validateColdRootIsolation(coldRoot, otherPath, otherKey string) error {

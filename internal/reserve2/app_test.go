@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -240,6 +241,72 @@ func TestInspectAuthApplyRefreshesRecoverableAuth(t *testing.T) {
 	}
 }
 
+func TestSelectColdCandidatesStaysInsideOldestRandomWindow(t *testing.T) {
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	app, _ := newTestApp(t, now)
+	app.env.SelectionWindow = 2
+	app.rng = rand.New(rand.NewSource(1))
+
+	auths := []*coreauth.Auth{
+		{FileName: "a.json"},
+		{FileName: "b.json"},
+		{FileName: "c.json"},
+		{FileName: "d.json"},
+		{FileName: "e.json"},
+	}
+	state := &StateFile{
+		Files: map[string]*FileState{
+			"a.json": {LastCheckedAt: now.Add(-5 * time.Hour)},
+			"b.json": {LastCheckedAt: now.Add(-4 * time.Hour)},
+			"c.json": {LastCheckedAt: now.Add(-3 * time.Hour)},
+			"d.json": {LastCheckedAt: now.Add(-2 * time.Hour)},
+			"e.json": {LastCheckedAt: now.Add(-1 * time.Hour)},
+		},
+	}
+
+	selected := app.selectColdCandidates(auths, state, 2)
+	if len(selected) != 2 {
+		t.Fatalf("len(selected) = %d, want 2", len(selected))
+	}
+	allowed := map[string]struct{}{
+		"a.json": {},
+		"b.json": {},
+		"c.json": {},
+		"d.json": {},
+	}
+	for _, authEntry := range selected {
+		if _, ok := allowed[authEntry.FileName]; !ok {
+			t.Fatalf("selected auth %q escaped oldest random window", authEntry.FileName)
+		}
+	}
+}
+
+func TestWaitBetweenInspectsUsesConfiguredDelayOnlyAfterFirstItem(t *testing.T) {
+	now := time.Date(2026, 4, 11, 12, 0, 0, 0, time.UTC)
+	app, _ := newTestApp(t, now)
+	app.env.SerialDelayMin = 2 * time.Second
+	app.env.SerialDelayMax = 2 * time.Second
+
+	delays := make([]time.Duration, 0)
+	app.sleep = func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	}
+
+	if err := app.waitBetweenInspects(context.Background(), true, 0); err != nil {
+		t.Fatalf("waitBetweenInspects(first) error = %v", err)
+	}
+	if err := app.waitBetweenInspects(context.Background(), true, 1); err != nil {
+		t.Fatalf("waitBetweenInspects(second) error = %v", err)
+	}
+	if len(delays) != 1 {
+		t.Fatalf("len(delays) = %d, want 1", len(delays))
+	}
+	if delays[0] != 2*time.Second {
+		t.Fatalf("delay = %s, want 2s", delays[0])
+	}
+}
+
 func newTestApp(t *testing.T, now time.Time) (*App, *EnvConfig) {
 	t.Helper()
 	root := t.TempDir()
@@ -254,8 +321,11 @@ func newTestApp(t *testing.T, now time.Time) (*App, *EnvConfig) {
 		CandidateFactor:   1.6,
 		SampleSize:        20,
 		SampleCap:         30,
+		SelectionWindow:   1,
 		Cooldown429:       24 * time.Hour,
 		CooldownTransient: 30 * time.Minute,
+		SerialDelayMin:    0,
+		SerialDelayMax:    0,
 		Timezone:          "UTC",
 	}
 	if err := env.EnsureDirectories(); err != nil {
@@ -266,6 +336,8 @@ func newTestApp(t *testing.T, now time.Time) (*App, *EnvConfig) {
 	}
 	app := NewApp(env, &config.Config{})
 	app.now = func() time.Time { return now }
+	app.rng = rand.New(rand.NewSource(1))
+	app.sleep = func(context.Context, time.Duration) error { return nil }
 	return app, env
 }
 

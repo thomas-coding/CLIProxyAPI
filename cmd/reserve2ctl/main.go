@@ -35,9 +35,9 @@ func runSample(args []string) {
 	apply := fs.Bool("apply", false, "apply changes")
 	_ = fs.Parse(args)
 
-	app := mustLoadApp(*envPath)
+	app, env := mustLoadApp(*envPath)
 	applyMode := resolveMode(*preview, *apply)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), env.SampleTimeout(applyMode))
 	defer cancel()
 	result, err := app.Sample(ctx, applyMode)
 	if err != nil {
@@ -53,9 +53,9 @@ func runSync(args []string) {
 	apply := fs.Bool("apply", false, "apply changes")
 	_ = fs.Parse(args)
 
-	app := mustLoadApp(*envPath)
+	app, env := mustLoadApp(*envPath)
 	applyMode := resolveMode(*preview, *apply)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), env.SyncTimeout(applyMode))
 	defer cancel()
 	result, err := app.Sync(ctx, applyMode)
 	if err != nil {
@@ -69,7 +69,7 @@ func runStatus(args []string) {
 	envPath := fs.String("env", "", "path to reserve2 env file")
 	_ = fs.Parse(args)
 
-	app := mustLoadApp(*envPath)
+	app, _ := mustLoadApp(*envPath)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	result, err := app.Status(ctx)
@@ -79,7 +79,7 @@ func runStatus(args []string) {
 	printJSON(result)
 }
 
-func mustLoadApp(envPath string) *reserve2.App {
+func mustLoadApp(envPath string) (*reserve2.App, *reserve2.EnvConfig) {
 	if envPath == "" {
 		fatalf("--env is required")
 	}
@@ -94,7 +94,7 @@ func mustLoadApp(envPath string) *reserve2.App {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
-	return reserve2.NewApp(env, cfg)
+	return reserve2.NewApp(env, cfg), env
 }
 
 func resolveMode(preview, apply bool) bool {

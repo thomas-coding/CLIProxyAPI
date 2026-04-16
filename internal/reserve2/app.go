@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -53,6 +54,8 @@ type App struct {
 	now             func() time.Time
 	usageProbeFunc  func(context.Context, *coreauth.Auth) (*usageProbeResponse, error)
 	refreshAuthFunc func(context.Context, *coreauth.Auth) (*coreauth.Auth, error)
+	rng             *rand.Rand
+	sleep           func(context.Context, time.Duration) error
 }
 
 type duplicateIndex struct {
@@ -91,6 +94,12 @@ type usageProbeResponse struct {
 	Body       string
 }
 
+type coldCandidate struct {
+	auth        *coreauth.Auth
+	lastChecked time.Time
+	lastRefresh time.Time
+}
+
 func NewApp(env *EnvConfig, cfg *config.Config) *App {
 	coldStore := auth.NewFileTokenStore()
 	coldStore.SetBaseDir(env.PoolDir())
@@ -105,6 +114,20 @@ func NewApp(env *EnvConfig, cfg *config.Config) *App {
 		reserve1Store:   reserve1Store,
 		productionStore: productionStore,
 		now:             time.Now,
+		rng:             rand.New(rand.NewSource(time.Now().UnixNano())),
+		sleep: func(ctx context.Context, delay time.Duration) error {
+			if delay <= 0 {
+				return nil
+			}
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
 	}
 }
 
@@ -135,7 +158,10 @@ func (a *App) Sample(ctx context.Context, apply bool) (*SampleResult, error) {
 		result.Summary.Requested = len(selected)
 
 		events := make([]eventRecord, 0)
-		for _, authEntry := range selected {
+		for index, authEntry := range selected {
+			if errWait := a.waitBetweenInspects(ctx, apply, index); errWait != nil {
+				return errWait
+			}
 			outcome, errInspect := a.inspectAuth(ctx, authEntry.Clone(), apply)
 			if errInspect != nil {
 				return errInspect
@@ -281,9 +307,12 @@ func (a *App) Sync(ctx context.Context, apply bool) (*SyncResult, error) {
 			return errDupIndex
 		}
 		events := make([]eventRecord, 0)
-		for _, authEntry := range selected {
+		for index, authEntry := range selected {
 			if result.Summary.PromotedToReserve1 >= desiredTransfer {
 				break
+			}
+			if errWait := a.waitBetweenInspects(ctx, apply, index); errWait != nil {
+				return errWait
 			}
 			outcome, errInspect := a.inspectAuth(ctx, authEntry.Clone(), apply)
 			if errInspect != nil {
@@ -560,18 +589,13 @@ func (a *App) selectColdCandidates(auths []*coreauth.Auth, state *StateFile, lim
 		return nil
 	}
 	now := a.now()
-	type candidate struct {
-		auth        *coreauth.Auth
-		lastChecked time.Time
-		lastRefresh time.Time
-	}
-	candidates := make([]candidate, 0, len(auths))
+	candidates := make([]coldCandidate, 0, len(auths))
 	for _, authEntry := range auths {
 		entry := state.Files[baseName(authEntry.FileName)]
 		if !isEligibleNow(authEntry, entry, now) {
 			continue
 		}
-		candidates = append(candidates, candidate{
+		candidates = append(candidates, coldCandidate{
 			auth:        authEntry,
 			lastChecked: zeroTime(entry, func(s *FileState) time.Time { return s.LastCheckedAt }),
 			lastRefresh: zeroTime(entry, func(s *FileState) time.Time { return s.LastRefreshAt }),
@@ -586,14 +610,68 @@ func (a *App) selectColdCandidates(auths []*coreauth.Auth, state *StateFile, lim
 		}
 		return strings.ToLower(baseName(candidates[i].auth.FileName)) < strings.ToLower(baseName(candidates[j].auth.FileName))
 	})
-	if limit > len(candidates) {
-		limit = len(candidates)
+	if len(candidates) == 0 {
+		return nil
+	}
+	windowCount := a.env.SelectionWindowCount(limit)
+	if windowCount > len(candidates) {
+		windowCount = len(candidates)
+	}
+	frontier := append([]coldCandidate(nil), candidates[:windowCount]...)
+	a.shuffleCandidates(frontier)
+	if limit > len(frontier) {
+		limit = len(frontier)
 	}
 	selected := make([]*coreauth.Auth, 0, limit)
 	for i := 0; i < limit; i++ {
-		selected = append(selected, candidates[i].auth)
+		selected = append(selected, frontier[i].auth)
 	}
 	return selected
+}
+
+func (a *App) shuffleCandidates(candidates []coldCandidate) {
+	if len(candidates) <= 1 {
+		return
+	}
+	if a == nil || a.rng == nil {
+		return
+	}
+	a.rng.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+}
+
+func (a *App) waitBetweenInspects(ctx context.Context, apply bool, index int) error {
+	if !apply || index <= 0 || a == nil || a.env == nil {
+		return nil
+	}
+	delay := a.nextSerialDelay()
+	if delay <= 0 {
+		return nil
+	}
+	if a.sleep == nil {
+		return nil
+	}
+	return a.sleep(ctx, delay)
+}
+
+func (a *App) nextSerialDelay() time.Duration {
+	if a == nil || a.env == nil {
+		return 0
+	}
+	minDelay := a.env.SerialDelayMin
+	maxDelay := a.env.SerialDelayMax
+	if maxDelay <= minDelay {
+		return minDelay
+	}
+	if a.rng == nil {
+		return minDelay
+	}
+	span := maxDelay - minDelay
+	if span <= 0 {
+		return minDelay
+	}
+	return minDelay + time.Duration(a.rng.Int63n(int64(span)+1))
 }
 
 func (a *App) inspectAuth(ctx context.Context, authEntry *coreauth.Auth, allowRefresh bool) (*inspectResult, error) {
