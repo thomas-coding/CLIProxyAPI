@@ -179,6 +179,9 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			log.Warnf("models parse failed from %s: %v", url, err)
 			continue
 		}
+		if preserved := preserveEmptyModelSections(&parsed, getModels()); len(preserved) > 0 {
+			log.Warnf("models catalog from %s has empty sections %v; preserving current definitions for those providers", url, preserved)
+		}
 		if err := validateModelsCatalog(&parsed); err != nil {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
@@ -187,6 +190,44 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 		return &parsed, url
 	}
 	return nil, ""
+}
+
+func preserveEmptyModelSections(target, fallback *staticModelsJSON) []string {
+	if target == nil || fallback == nil {
+		return nil
+	}
+
+	type section struct {
+		name     string
+		target   *[]*ModelInfo
+		fallback []*ModelInfo
+	}
+
+	sections := []section{
+		{name: "claude", target: &target.Claude, fallback: fallback.Claude},
+		{name: "gemini", target: &target.Gemini, fallback: fallback.Gemini},
+		{name: "vertex", target: &target.Vertex, fallback: fallback.Vertex},
+		{name: "gemini-cli", target: &target.GeminiCLI, fallback: fallback.GeminiCLI},
+		{name: "aistudio", target: &target.AIStudio, fallback: fallback.AIStudio},
+		{name: "codex-free", target: &target.CodexFree, fallback: fallback.CodexFree},
+		{name: "codex-team", target: &target.CodexTeam, fallback: fallback.CodexTeam},
+		{name: "codex-plus", target: &target.CodexPlus, fallback: fallback.CodexPlus},
+		{name: "codex-pro", target: &target.CodexPro, fallback: fallback.CodexPro},
+		{name: "qwen", target: &target.Qwen, fallback: fallback.Qwen},
+		{name: "iflow", target: &target.IFlow, fallback: fallback.IFlow},
+		{name: "kimi", target: &target.Kimi, fallback: fallback.Kimi},
+		{name: "antigravity", target: &target.Antigravity, fallback: fallback.Antigravity},
+	}
+
+	var preserved []string
+	for _, s := range sections {
+		if len(*s.target) > 0 || len(s.fallback) == 0 {
+			continue
+		}
+		*s.target = cloneModelInfos(s.fallback)
+		preserved = append(preserved, s.name)
+	}
+	return preserved
 }
 
 // detectChangedProviders compares two model catalogs and returns provider names
