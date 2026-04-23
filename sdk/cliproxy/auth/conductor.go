@@ -1938,7 +1938,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	clearModelQuota := false
 	setModelQuota := false
 	var authSnapshot *Auth
-	shouldArchiveAccountDeactivated := false
+	shouldArchiveExternal401Auth := false
 	var quotaReentryAttempt *quotaReentryAttempt
 
 	m.mu.Lock()
@@ -1984,7 +1984,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				if auth401QuarantineKind(result.Error) != auth401KindNone {
+				if auth401QuarantineKindForAuth(auth, result.Error, now) != auth401KindNone {
 					applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 				} else {
 					state := ensureModelState(auth, result.Model)
@@ -2069,9 +2069,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		if m.shouldArchiveAccountDeactivated(auth) {
+		if m.shouldArchiveExternal401Auth(auth) {
 			authSnapshot = m.stageArchivedAuthRemovalLocked(auth)
-			shouldArchiveAccountDeactivated = authSnapshot != nil
+			shouldArchiveExternal401Auth = authSnapshot != nil
 		} else {
 			authSnapshot = auth.Clone()
 			_ = m.persist(ctx, auth)
@@ -2079,18 +2079,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	archived := false
-	if shouldArchiveAccountDeactivated && authSnapshot != nil {
-		archiveResult, err := m.archiveAccountDeactivated(ctx, authSnapshot)
+	if shouldArchiveExternal401Auth && authSnapshot != nil {
+		archiveResult, err := m.archiveExternal401Auth(ctx, authSnapshot)
 		if err != nil {
-			log.WithError(err).Warnf("archive account_deactivated auth %s to external-401 failed", authSnapshot.ID)
+			log.WithError(err).Warnf("archive external-401 auth %s failed", authSnapshot.ID)
 			m.restoreArchivedAuth(authSnapshot)
 			_ = m.persist(ctx, authSnapshot)
 		} else {
 			log.WithFields(log.Fields{
+				"reason":      authWide401Quarantine(authSnapshot),
 				"auth_id":     authSnapshot.ID,
 				"source_path": archiveResult.SourcePath,
 				"target_path": archiveResult.TargetPath,
-			}).Warn("archived account_deactivated auth to external-401")
+			}).Warn("archived auth to external-401")
 			m.removeArchivedAuth(authSnapshot.ID)
 			archived = true
 		}
@@ -2544,12 +2545,12 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	auth.UpdatedAt = now
 	auth.NextRefreshAfter = time.Time{}
 	if resultErr != nil {
-		auth.LastError = normalize401Error(resultErr)
+		auth.LastError = normalize401ErrorForAuth(auth, resultErr, now)
 		if auth.LastError != nil && auth.LastError.Message != "" {
 			auth.StatusMessage = auth.LastError.Message
 		}
 	}
-	if auth401QuarantineKind(auth.LastError) != auth401KindNone {
+	if auth401QuarantineKindForAuth(auth, auth.LastError, now) != auth401KindNone {
 		applyAuth401Quarantine(auth, auth.LastError, now)
 		return
 	}
@@ -3546,7 +3547,7 @@ func (m *Manager) refreshAuthSync(ctx context.Context, id string) (*Auth, error)
 func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExecErr error, now time.Time) {
 	refreshErr := resultErrorFromExecutionError(refreshExecErr)
 	var authSnapshot *Auth
-	shouldArchiveAccountDeactivated := false
+	shouldArchiveExternal401Auth := false
 	m.mu.Lock()
 	if current := m.auths[id]; current != nil {
 		if current.Metadata == nil {
@@ -3563,11 +3564,11 @@ func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExe
 			}
 			applyAuthFailureState(current, refreshErr, nil, now)
 		default:
-			if auth401QuarantineKind(refreshErr) != auth401KindNone {
+			if auth401QuarantineKindForAuth(current, refreshErr, now) != auth401KindNone {
 				applyAuthFailureState(current, refreshErr, nil, now)
 			} else {
 				current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-				current.LastError = normalize401Error(refreshErr)
+				current.LastError = normalize401ErrorForAuth(current, refreshErr, now)
 				if current.LastError == nil {
 					current.LastError = &Error{Message: refreshExecErr.Error()}
 				}
@@ -3576,31 +3577,32 @@ func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExe
 				current.UpdatedAt = now
 			}
 		}
-		if m.shouldArchiveAccountDeactivated(current) {
+		if m.shouldArchiveExternal401Auth(current) {
 			authSnapshot = m.stageArchivedAuthRemovalLocked(current)
-			shouldArchiveAccountDeactivated = authSnapshot != nil
+			shouldArchiveExternal401Auth = authSnapshot != nil
 		} else {
 			m.auths[id] = current
 			authSnapshot = current.Clone()
 		}
-		if !shouldArchiveAccountDeactivated && m.scheduler != nil {
+		if !shouldArchiveExternal401Auth && m.scheduler != nil {
 			m.scheduler.upsertAuth(authSnapshot)
 		}
 	}
 	m.mu.Unlock()
-	if shouldArchiveAccountDeactivated && authSnapshot != nil {
-		archiveResult, err := m.archiveAccountDeactivated(ctx, authSnapshot)
+	if shouldArchiveExternal401Auth && authSnapshot != nil {
+		archiveResult, err := m.archiveExternal401Auth(ctx, authSnapshot)
 		if err != nil {
-			log.WithError(err).Warnf("archive refresh-detected account_deactivated auth %s to external-401 failed", authSnapshot.ID)
+			log.WithError(err).Warnf("archive refresh-detected external-401 auth %s failed", authSnapshot.ID)
 			m.restoreArchivedAuth(authSnapshot)
 			_ = m.persist(ctx, authSnapshot)
 			return
 		}
 		log.WithFields(log.Fields{
+			"reason":      authWide401Quarantine(authSnapshot),
 			"auth_id":     authSnapshot.ID,
 			"source_path": archiveResult.SourcePath,
 			"target_path": archiveResult.TargetPath,
-		}).Warn("archived refresh-detected account_deactivated auth to external-401")
+		}).Warn("archived refresh-detected auth to external-401")
 		m.removeArchivedAuth(authSnapshot.ID)
 		return
 	}
@@ -3631,6 +3633,22 @@ func codexRefreshBackoffError() *Error {
 	}
 }
 
+func codexTokenExpiredError() *Error {
+	return &Error{
+		Message:    auth401KindTokenExpired,
+		HTTPStatus: http.StatusUnauthorized,
+	}
+}
+
+func (m *Manager) quarantineHardExpiredCodexAuthWithoutRefresh(ctx context.Context, auth *Auth, now time.Time) error {
+	if !isHardExpiredCodexAuthWithoutRefresh(auth, now) {
+		return nil
+	}
+	terminalErr := codexTokenExpiredError()
+	m.applyRefreshFailure(ctx, auth.ID, terminalErr, now)
+	return terminalErr
+}
+
 func codexQuarantineError(auth *Auth) error {
 	if auth == nil {
 		return nil
@@ -3638,7 +3656,7 @@ func codexQuarantineError(auth *Auth) error {
 	switch authWide401Quarantine(auth) {
 	case auth401KindNone:
 		return nil
-	case auth401KindTokenInvalidated, auth401KindAccountDeactivated:
+	case auth401KindTokenInvalidated, auth401KindAccountDeactivated, auth401KindTokenExpired:
 		if auth.LastError != nil {
 			return auth.LastError
 		}
@@ -3736,6 +3754,9 @@ func (m *Manager) prepareCodexAuthForHardRefresh(ctx context.Context, auth *Auth
 		}
 		if quarantineErr := codexQuarantineError(current); quarantineErr != nil {
 			return nil, quarantineErr
+		}
+		if terminalErr := m.quarantineHardExpiredCodexAuthWithoutRefresh(ctx, current, time.Now()); terminalErr != nil {
+			return nil, terminalErr
 		}
 		if codexOnUseRefreshModeForAuth(current, time.Now()) != codexOnUseRefreshHard {
 			return current, nil

@@ -10,6 +10,7 @@ const (
 	auth401KindNone               = ""
 	auth401KindTokenInvalidated   = "token_invalidated"
 	auth401KindAccountDeactivated = "account_deactivated"
+	auth401KindTokenExpired       = "token_expired"
 	auth401ProbeInterval          = 24 * time.Hour
 )
 
@@ -88,11 +89,22 @@ func normalize401Error(err *Error) *Error {
 	return cloned
 }
 
+func normalize401ErrorForAuth(auth *Auth, err *Error, now time.Time) *Error {
+	if err == nil {
+		return nil
+	}
+	cloned := cloneError(err)
+	if kind := auth401QuarantineKindForAuth(auth, cloned, now); kind != auth401KindNone {
+		cloned.Code = kind
+	}
+	return cloned
+}
+
 func authWide401Quarantine(auth *Auth) string {
 	if auth == nil {
 		return auth401KindNone
 	}
-	return auth401QuarantineKind(auth.LastError)
+	return auth401QuarantineKindForAuth(auth, auth.LastError, time.Now())
 }
 
 func authWide401NextProbe(auth *Auth) time.Time {
@@ -115,16 +127,131 @@ func authWide401BlockState(auth *Auth, now time.Time) (bool, time.Time) {
 		return true, next
 	case auth401KindAccountDeactivated:
 		return true, time.Time{}
+	case auth401KindTokenExpired:
+		return true, time.Time{}
 	default:
 		return false, time.Time{}
 	}
+}
+
+func auth401QuarantineKindForAuth(auth *Auth, err *Error, now time.Time) string {
+	if kind := auth401QuarantineKind(err); kind != auth401KindNone {
+		return kind
+	}
+	if auth401TokenExpired(err) && isHardExpiredCodexAuthWithoutRefresh(auth, now) {
+		return auth401KindTokenExpired
+	}
+	return auth401KindNone
+}
+
+func auth401TokenExpired(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if auth401TokenExpiredText(err.Code) {
+		return true
+	}
+	return auth401TokenExpiredFromMessage(err.Message)
+}
+
+func auth401TokenExpiredText(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	return lower == auth401KindTokenExpired || strings.Contains(lower, auth401KindTokenExpired)
+}
+
+func auth401TokenExpiredFromMessage(message string) bool {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return false
+	}
+	if auth401TokenExpiredText(trimmed) {
+		return true
+	}
+
+	var envelope upstreamErrorEnvelope
+	if err := json.Unmarshal([]byte(trimmed), &envelope); err == nil {
+		if auth401TokenExpiredText(envelope.Error.Code) {
+			return true
+		}
+		if auth401TokenExpiredText(envelope.Error.Message) {
+			return true
+		}
+	}
+
+	lower := strings.ToLower(trimmed)
+	switch {
+	case strings.Contains(lower, "provided authentication token is expired"),
+		strings.Contains(lower, "authentication token is expired"),
+		strings.Contains(lower, "authentication has expired"),
+		strings.Contains(lower, "token has expired"),
+		strings.Contains(lower, "token expired"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isHardExpiredCodexAuthWithoutRefresh(auth *Auth, now time.Time) bool {
+	if auth == nil || !isCodexProvider(auth.Provider) {
+		return false
+	}
+	expiry, hasExpiry := auth.ExpirationTime()
+	if !hasExpiry || expiry.IsZero() || expiry.After(now) {
+		return false
+	}
+	return !authHasRefreshToken(auth)
+}
+
+func authHasRefreshToken(auth *Auth) bool {
+	return auth != nil && auth.RefreshToken() != ""
+}
+
+func stringValueFromMetadata(meta map[string]any, keys ...string) string {
+	if meta == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if val, ok := meta[key]; ok {
+			switch typed := val.(type) {
+			case string:
+				if trimmed := strings.TrimSpace(typed); trimmed != "" {
+					return trimmed
+				}
+			case map[string]any:
+				if nested := stringValueFromMetadata(typed, key); nested != "" {
+					return nested
+				}
+			case map[string]string:
+				if nested := strings.TrimSpace(typed[key]); nested != "" {
+					return nested
+				}
+			}
+		}
+	}
+	for _, nestedKey := range []string{"token", "Token"} {
+		if nested, ok := meta[nestedKey]; ok {
+			switch typed := nested.(type) {
+			case map[string]any:
+				if val := stringValueFromMetadata(typed, keys...); val != "" {
+					return val
+				}
+			case map[string]string:
+				for _, key := range keys {
+					if val := strings.TrimSpace(typed[key]); val != "" {
+						return val
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func applyAuth401Quarantine(auth *Auth, resultErr *Error, now time.Time) {
 	if auth == nil {
 		return
 	}
-	normalizedErr := normalize401Error(resultErr)
+	normalizedErr := normalize401ErrorForAuth(auth, resultErr, now)
 	auth.Unavailable = true
 	auth.Status = StatusError
 	auth.UpdatedAt = now
@@ -135,7 +262,7 @@ func applyAuth401Quarantine(auth *Auth, resultErr *Error, now time.Time) {
 		auth.StatusMessage = normalizedErr.Message
 	}
 
-	switch auth401QuarantineKind(normalizedErr) {
+	switch auth401QuarantineKindForAuth(auth, normalizedErr, now) {
 	case auth401KindTokenInvalidated:
 		probeAt := now.Add(auth401ProbeInterval)
 		auth.NextRetryAfter = probeAt
@@ -148,6 +275,12 @@ func applyAuth401Quarantine(auth *Auth, resultErr *Error, now time.Time) {
 		auth.NextRefreshAfter = time.Time{}
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = auth401KindAccountDeactivated
+		}
+	case auth401KindTokenExpired:
+		auth.NextRetryAfter = time.Time{}
+		auth.NextRefreshAfter = time.Time{}
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = auth401KindTokenExpired
 		}
 	}
 }

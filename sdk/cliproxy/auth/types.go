@@ -343,6 +343,24 @@ func parseIntAny(val any) (int, bool) {
 	}
 }
 
+// RefreshToken returns the OAuth refresh token from the supported auth file shapes.
+func (a *Auth) RefreshToken() string {
+	if a == nil {
+		return ""
+	}
+	if token := stringValueFromMetadata(a.Metadata, "refresh_token"); token != "" {
+		return token
+	}
+	if a.Attributes != nil {
+		for _, key := range []string{"refresh_token", "refreshToken"} {
+			if val := strings.TrimSpace(a.Attributes[key]); val != "" {
+				return val
+			}
+		}
+	}
+	return ""
+}
+
 func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""

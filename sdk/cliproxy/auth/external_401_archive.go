@@ -39,14 +39,19 @@ type external401ArchiveResult struct {
 	TargetPath string
 }
 
-func (m *Manager) shouldArchiveAccountDeactivated(auth *Auth) bool {
+func (m *Manager) shouldArchiveExternal401Auth(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	return authWide401Quarantine(auth) == auth401KindAccountDeactivated
+	switch authWide401Quarantine(auth) {
+	case auth401KindAccountDeactivated, auth401KindTokenExpired:
+		return true
+	default:
+		return false
+	}
 }
 
-func (m *Manager) archiveAccountDeactivated(ctx context.Context, auth *Auth) (*external401ArchiveResult, error) {
+func (m *Manager) archiveExternal401Auth(ctx context.Context, auth *Auth) (*external401ArchiveResult, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("auth is nil")
 	}
@@ -94,7 +99,11 @@ func (m *Manager) syncArchivedAuthDeletion(ctx context.Context, auth *Auth, sour
 	if messageID == "" {
 		messageID = filepath.Base(sourcePath)
 	}
-	message := "Archive account_deactivated auth " + messageID
+	reason := authWide401Quarantine(auth)
+	if reason == "" {
+		reason = "terminal_401"
+	}
+	message := "Archive " + reason + " auth " + messageID
 	if archiver, ok := m.store.(authFileArchiveStore); ok {
 		return archiver.ArchiveAuthFile(ctx, sourcePath, targetPath, message)
 	}

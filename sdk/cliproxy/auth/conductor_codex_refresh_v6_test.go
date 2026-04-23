@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
@@ -52,6 +53,22 @@ type firstAuthSelector struct{}
 func (s *firstAuthSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	if len(auths) == 0 {
 		return nil, nil
+	}
+	return auths[0], nil
+}
+
+type targetAuthSelector struct {
+	id string
+}
+
+func (s *targetAuthSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if len(auths) == 0 {
+		return nil, nil
+	}
+	for _, auth := range auths {
+		if auth != nil && auth.ID == s.id {
+			return auth, nil
+		}
 	}
 	return auths[0], nil
 }
@@ -260,7 +277,7 @@ func TestManager_executeMixedOnce_CodexSoftRefreshFailureFailsOpen(t *testing.T)
 
 	ctx := context.Background()
 	now := time.Now()
-	manager := NewManager(nil, &firstAuthSelector{}, nil)
+	manager := NewManager(nil, &targetAuthSelector{id: "auth-a"}, nil)
 	executedAuthIDs := make([]string, 0, 1)
 	refreshCalls := 0
 	manager.RegisterExecutor(codexRefreshV6TestExecutor{
@@ -278,7 +295,8 @@ func TestManager_executeMixedOnce_CodexSoftRefreshFailureFailsOpen(t *testing.T)
 		ID:       "auth-a",
 		Provider: "codex",
 		Metadata: map[string]any{
-			"expires_at": now.Add(time.Minute).Format(time.RFC3339),
+			"expires_at":    now.Add(time.Minute).Format(time.RFC3339),
+			"refresh_token": "refresh-token",
 		},
 	}
 	authB := &Auth{
@@ -319,7 +337,7 @@ func TestManager_executeMixedOnce_CodexExpiredRefreshFailureFallsBackToNextAuth(
 
 	ctx := context.Background()
 	now := time.Now()
-	manager := NewManager(nil, &firstAuthSelector{}, nil)
+	manager := NewManager(nil, &targetAuthSelector{id: "auth-a"}, nil)
 	executedAuthIDs := make([]string, 0, 1)
 	manager.RegisterExecutor(codexRefreshV6TestExecutor{
 		refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
@@ -338,7 +356,8 @@ func TestManager_executeMixedOnce_CodexExpiredRefreshFailureFallsBackToNextAuth(
 		ID:       "auth-a",
 		Provider: "codex",
 		Metadata: map[string]any{
-			"expires_at": now.Add(-time.Minute).Format(time.RFC3339),
+			"expires_at":    now.Add(-time.Minute).Format(time.RFC3339),
+			"refresh_token": "refresh-token",
 		},
 	}
 	authB := &Auth{
@@ -360,6 +379,75 @@ func TestManager_executeMixedOnce_CodexExpiredRefreshFailureFallsBackToNextAuth(
 	}
 	if len(executedAuthIDs) != 1 || executedAuthIDs[0] != "auth-b" {
 		t.Fatalf("executed auth ids = %v, want [auth-b]", executedAuthIDs)
+	}
+}
+
+func TestManager_executeMixedOnce_CodexHardExpiredWithoutRefreshSkipsBeforeExecution(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	now := time.Now()
+	store := &quarantineWarehouseStore{root: t.TempDir()}
+	manager := NewManager(store, &targetAuthSelector{id: "dead-auth-a"}, nil)
+	refreshCalls := 0
+	executedAuthIDs := make([]string, 0, 1)
+	manager.RegisterExecutor(codexRefreshV6TestExecutor{
+		refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
+			refreshCalls++
+			return auth.Clone(), nil
+		},
+		executeFn: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			executedAuthIDs = append(executedAuthIDs, auth.ID)
+			return cliproxyexecutor.Response{}, nil
+		},
+	})
+
+	authA := &Auth{
+		ID:       "dead-auth-a",
+		FileName: "dead-auth-a.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"expired":       now.Add(-time.Minute).Format(time.RFC3339),
+			"refresh_token": "",
+		},
+	}
+	authB := &Auth{
+		ID:       "live-auth-b",
+		FileName: "live-auth-b.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"expires_at": now.Add(time.Hour).Format(time.RFC3339),
+		},
+	}
+	if _, err := manager.Register(ctx, authA); err != nil {
+		t.Fatalf("register auth-a: %v", err)
+	}
+	if _, err := manager.Register(ctx, authB); err != nil {
+		t.Fatalf("register auth-b: %v", err)
+	}
+	sourcePathA, err := quarantineStorePath(store.root, authA)
+	if err != nil {
+		t.Fatalf("quarantineStorePath(dead-auth-a): %v", err)
+	}
+
+	if _, err := manager.executeMixedOnce(ctx, []string{"codex"}, cliproxyexecutor.Request{}, cliproxyexecutor.Options{}, 2); err != nil {
+		t.Fatalf("executeMixedOnce() error = %v", err)
+	}
+	if refreshCalls != 0 {
+		t.Fatalf("refresh calls = %d, want 0", refreshCalls)
+	}
+	if len(executedAuthIDs) != 1 || executedAuthIDs[0] != "live-auth-b" {
+		t.Fatalf("executed auth ids = %v, want [live-auth-b]", executedAuthIDs)
+	}
+	if updated, ok := manager.GetByID(authA.ID); ok || updated != nil {
+		t.Fatalf("expected dead-auth-a removed from manager after preflight archive")
+	}
+	if _, err := os.Stat(sourcePathA); !os.IsNotExist(err) {
+		t.Fatalf("expected dead-auth-a source removed, stat err = %v", err)
+	}
+	archivedPath := findArchivedWarehouseFile(t, store.root, "dead-auth-a.json")
+	if _, err := os.Stat(archivedPath); err != nil {
+		t.Fatalf("expected archived dead-auth-a file: %v", err)
 	}
 }
 
@@ -388,7 +476,8 @@ func TestManager_prepareAuthForExecution_CodexHardRefreshWaitsForSemaphore(t *te
 		ID:       "hard-wait-auth",
 		Provider: "codex",
 		Metadata: map[string]any{
-			"expires_at": now.Add(-time.Minute).Format(time.RFC3339),
+			"expires_at":    now.Add(-time.Minute).Format(time.RFC3339),
+			"refresh_token": "refresh-token",
 		},
 	}
 	if _, err := manager.Register(ctx, auth); err != nil {
@@ -432,7 +521,8 @@ func TestManager_prepareAuthForExecution_CodexHardRefreshWaitsForExistingPending
 		Provider:         "codex",
 		NextRefreshAfter: now.Add(30 * time.Second),
 		Metadata: map[string]any{
-			"expires_at": now.Add(-time.Minute).Format(time.RFC3339),
+			"expires_at":    now.Add(-time.Minute).Format(time.RFC3339),
+			"refresh_token": "refresh-token",
 		},
 	}
 	if _, err := manager.Register(ctx, auth); err != nil {
@@ -485,7 +575,8 @@ func TestManager_prepareAuthForExecution_CodexHardRefreshPropagatesContextCancel
 		ID:       "hard-cancel-auth",
 		Provider: "codex",
 		Metadata: map[string]any{
-			"expires_at": now.Add(-time.Minute).Format(time.RFC3339),
+			"expires_at":    now.Add(-time.Minute).Format(time.RFC3339),
+			"refresh_token": "refresh-token",
 		},
 	}
 	if _, err := manager.Register(context.Background(), auth); err != nil {
