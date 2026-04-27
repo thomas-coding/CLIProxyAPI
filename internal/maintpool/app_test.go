@@ -214,6 +214,130 @@ func TestProcessDueAuthRefreshesWhenAccessTokenMissing(t *testing.T) {
 	}
 }
 
+func TestProcessDueAuthRefreshesDirectlyWhenRefreshIsDue(t *testing.T) {
+	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
+	app, _ := newTestApp(t, now)
+
+	probeCalls := 0
+	refreshCalls := 0
+	app.usageProbeFunc = func(_ context.Context, authEntry *coreauth.Auth) (*usageProbeResponse, error) {
+		probeCalls++
+		if got := authEntry.Metadata["access_token"]; got != "fresh-token" {
+			t.Fatalf("usage probe saw access_token = %v, want fresh-token from post-refresh confirm only", got)
+		}
+		return &usageProbeResponse{StatusCode: http.StatusOK, Body: "{}"}, nil
+	}
+	app.refreshAuthFunc = func(_ context.Context, authEntry *coreauth.Auth) (*coreauth.Auth, error) {
+		refreshCalls++
+		updated := authEntry.Clone()
+		if updated.Metadata == nil {
+			updated.Metadata = map[string]any{}
+		}
+		updated.Metadata["type"] = "codex"
+		updated.Metadata["access_token"] = "fresh-token"
+		updated.Metadata["account_id"] = "acct-1"
+		updated.Metadata["refresh_token"] = "refresh-1"
+		return updated, nil
+	}
+
+	state := &StateFile{Files: map[string]*FileState{}}
+	summary := &ScanSummary{}
+	events := make([]Event, 0, 1)
+	removed, err := app.processDueAuth(context.Background(), dueCandidate{
+		auth: &coreauth.Auth{
+			FileName: "pool-a.json",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"type":          "codex",
+				"refresh_token": "refresh-1",
+			},
+		},
+		dueRefresh: true,
+	}, state, summary, &events)
+	if err != nil {
+		t.Fatalf("processDueAuth() error = %v", err)
+	}
+	if removed {
+		t.Fatal("removed = true, want false")
+	}
+	if probeCalls != 1 {
+		t.Fatalf("probeCalls = %d, want 1 confirm probe after refresh", probeCalls)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1", refreshCalls)
+	}
+	if summary.ScheduledRefreshOK != 1 {
+		t.Fatalf("summary.ScheduledRefreshOK = %d, want 1", summary.ScheduledRefreshOK)
+	}
+	entry := state.Files["pool-a.json"]
+	if entry == nil {
+		t.Fatal("state entry missing for pool-a.json")
+	}
+	if entry.LastResult != resultScheduledRefreshOK {
+		t.Fatalf("entry.LastResult = %q, want %q", entry.LastResult, resultScheduledRefreshOK)
+	}
+}
+
+func TestScheduledRefreshPreservesFutureUsageAuditWindow(t *testing.T) {
+	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
+	app, _ := newTestApp(t, now)
+
+	app.usageProbeFunc = func(_ context.Context, authEntry *coreauth.Auth) (*usageProbeResponse, error) {
+		if got := authEntry.Metadata["access_token"]; got != "fresh-token" {
+			t.Fatalf("usage probe saw access_token = %v, want fresh-token", got)
+		}
+		return &usageProbeResponse{StatusCode: http.StatusOK, Body: "{}"}, nil
+	}
+	app.refreshAuthFunc = func(_ context.Context, authEntry *coreauth.Auth) (*coreauth.Auth, error) {
+		updated := authEntry.Clone()
+		if updated.Metadata == nil {
+			updated.Metadata = map[string]any{}
+		}
+		updated.Metadata["type"] = "codex"
+		updated.Metadata["access_token"] = "fresh-token"
+		updated.Metadata["account_id"] = "acct-1"
+		updated.Metadata["refresh_token"] = "refresh-1"
+		return updated, nil
+	}
+
+	futureProbeAt := now.Add(80 * 24 * time.Hour)
+	state := &StateFile{
+		Files: map[string]*FileState{
+			"pool-a.json": {
+				ImportedAt:       now.Add(-40 * 24 * time.Hour),
+				NextProbeAt:      futureProbeAt,
+				NextRefreshDueAt: now.Add(-time.Hour),
+			},
+		},
+	}
+	summary := &ScanSummary{}
+	events := make([]Event, 0, 1)
+	removed, err := app.processDueAuth(context.Background(), dueCandidate{
+		auth: &coreauth.Auth{
+			FileName: "pool-a.json",
+			Provider: "codex",
+			Metadata: map[string]any{
+				"type":          "codex",
+				"refresh_token": "refresh-1",
+			},
+		},
+		dueRefresh: true,
+	}, state, summary, &events)
+	if err != nil {
+		t.Fatalf("processDueAuth() error = %v", err)
+	}
+	if removed {
+		t.Fatal("removed = true, want false")
+	}
+	entry := state.Files["pool-a.json"]
+	if entry == nil {
+		t.Fatal("state entry missing for pool-a.json")
+	}
+	if !entry.NextProbeAt.Equal(futureProbeAt) {
+		t.Fatalf("entry.NextProbeAt = %v, want preserved future audit window %v", entry.NextProbeAt, futureProbeAt)
+	}
+}
+
 func TestSyntheticImportedStateForRecentMissingStateUsesRecoveryWindow(t *testing.T) {
 	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
 	authEntry := &coreauth.Auth{

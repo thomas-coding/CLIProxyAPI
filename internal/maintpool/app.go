@@ -473,13 +473,18 @@ func (a *App) processDueAuth(ctx context.Context, candidate dueCandidate, state 
 	if existing == nil {
 		*entry = *effectiveStateForAuth(current, nil, a.now())
 	}
+	populateStateIdentity(entry, current)
 
+	if candidate.dueRefresh {
+		return a.handleRefreshPath(ctx, current, entry, true, summary, events)
+	}
+	return a.handleUsageAuditPath(ctx, current, entry, summary, events)
+}
+
+func (a *App) handleUsageAuditPath(ctx context.Context, current *coreauth.Auth, entry *FileState, summary *ScanSummary, events *[]Event) (bool, error) {
 	resp, err := a.runUsageProbe(ctx, current.Clone())
 	now := a.now()
 	entry.LastProbeAt = now
-	entry.Email = authEmail(current)
-	entry.AccountID = authAccountID(current)
-	entry.RefreshTokenSHA = refreshTokenHash(current)
 	entry.LastHTTPStatus = responseHTTPStatus(resp, err)
 	probeClass := classifyHTTPOrError(resp, err)
 
@@ -487,9 +492,6 @@ func (a *App) processDueAuth(ctx context.Context, candidate dueCandidate, state 
 	case classificationSuccess:
 		entry.LastProbeOKAt = now
 		entry.CooldownUntil = time.Time{}
-		if candidate.dueRefresh {
-			return a.handleRefreshPath(ctx, current, entry, true, summary, events)
-		}
 		entry.LastResult = resultProbeOK
 		entry.NextProbeAt = now.Add(a.nextProbeDelay())
 		if entry.NextRefreshDueAt.IsZero() {
@@ -631,9 +633,7 @@ func (a *App) handleRefreshPath(ctx context.Context, current *coreauth.Auth, ent
 	}
 	entry.LastRefreshAttemptAt = refreshTime
 	entry.LastRefreshOKAt = refreshTime
-	entry.Email = authEmail(refreshed)
-	entry.AccountID = authAccountID(refreshed)
-	entry.RefreshTokenSHA = refreshTokenHash(refreshed)
+	populateStateIdentity(entry, refreshed)
 
 	if err := a.waitBetweenChainSteps(ctx, a.nextConfirmChainDelay()); err != nil {
 		return false, err
@@ -648,7 +648,11 @@ func (a *App) handleRefreshPath(ctx context.Context, current *coreauth.Auth, ent
 	case classificationSuccess:
 		entry.LastProbeOKAt = confirmTime
 		entry.CooldownUntil = time.Time{}
-		entry.NextProbeAt = confirmTime.Add(a.nextProbeDelay())
+		// A refresh confirm can satisfy an overdue audit, but it should not
+		// keep pushing a still-future audit window out forever.
+		if entry.NextProbeAt.IsZero() || !entry.NextProbeAt.After(confirmTime) {
+			entry.NextProbeAt = confirmTime.Add(a.nextProbeDelay())
+		}
 		entry.NextRefreshDueAt = refreshTime.Add(a.nextRefreshDelay())
 		if scheduled {
 			entry.LastResult = resultScheduledRefreshOK
@@ -1021,9 +1025,7 @@ func initializeImportedState(a *App, entry *FileState, authEntry *coreauth.Auth,
 	entry.CooldownUntil = time.Time{}
 	entry.LastResult = resultImported
 	entry.LastHTTPStatus = 0
-	entry.Email = authEmail(authEntry)
-	entry.AccountID = authAccountID(authEntry)
-	entry.RefreshTokenSHA = refreshTokenHash(authEntry)
+	populateStateIdentity(entry, authEntry)
 }
 
 func ensureStateEntry(state *StateFile, name string) *FileState {
@@ -1682,6 +1684,15 @@ func authEmail(authEntry *coreauth.Auth) string {
 
 func authAccountID(authEntry *coreauth.Auth) string {
 	return strings.TrimSpace(resolveChatGPTAccountID(authEntry))
+}
+
+func populateStateIdentity(entry *FileState, authEntry *coreauth.Auth) {
+	if entry == nil {
+		return
+	}
+	entry.Email = authEmail(authEntry)
+	entry.AccountID = authAccountID(authEntry)
+	entry.RefreshTokenSHA = refreshTokenHash(authEntry)
 }
 
 func refreshTokenHash(authEntry *coreauth.Auth) string {
