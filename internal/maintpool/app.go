@@ -1608,6 +1608,9 @@ func initializeImportedState(a *App, entry *FileState, authEntry *coreauth.Auth,
 	entry.BaselineState = ""
 	if entry.Lane == laneBaselinePending {
 		entry.BaselineState = baselineStatePending
+		// Baseline-pending imports are an explicit admission queue, not ordinary
+		// passive imports. They should be eligible for immediate baseline refresh.
+		entry.NextRefreshDueAt = now
 	}
 	populateStateIdentity(entry, authEntry)
 }

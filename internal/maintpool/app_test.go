@@ -189,6 +189,38 @@ func TestImportApplyStoresBaselinePendingMetadata(t *testing.T) {
 	}
 }
 
+func TestImportApplyBaselinePendingIsImmediatelySelectableForRefresh(t *testing.T) {
+	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
+	app, _ := newTestApp(t, now)
+
+	sourceDir := filepath.Join(t.TempDir(), "source")
+	writeAuthFixture(t, filepath.Join(sourceDir, "a.json"), map[string]any{
+		"type":          "codex",
+		"refresh_token": "refresh-a",
+	})
+
+	_, err := app.Import(context.Background(), sourceDir, ImportOptions{
+		Apply:         true,
+		CohortID:      "cohort-1",
+		SourceBatchID: "batch-1",
+		Lane:          laneBaselinePending,
+	})
+	if err != nil {
+		t.Fatalf("Import(apply) error = %v", err)
+	}
+
+	preview, err := app.Scan(context.Background(), false, 1)
+	if err != nil {
+		t.Fatalf("Scan(preview) error = %v", err)
+	}
+	if preview.Summary.Selected != 1 {
+		t.Fatalf("preview.Summary.Selected = %d, want 1", preview.Summary.Selected)
+	}
+	if len(preview.Selected) != 1 || preview.Selected[0] != "a.json" {
+		t.Fatalf("preview.Selected = %v, want [a.json]", preview.Selected)
+	}
+}
+
 func TestImportApplyRejectsBaselinePendingWithoutCohortID(t *testing.T) {
 	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
 	app, _ := newTestApp(t, now)
