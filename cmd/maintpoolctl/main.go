@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/maintpool"
@@ -15,7 +16,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fatalf("usage: %s <status|scan|import|takeout> [flags]", os.Args[0])
+		fatalf("usage: %s <status|scan|import|assign-lanes|adopt-legacy|clear-emergency-stop|takeout> [flags]", os.Args[0])
 	}
 	switch os.Args[1] {
 	case "status":
@@ -24,6 +25,12 @@ func main() {
 		runScan(os.Args[2:])
 	case "import":
 		runImport(os.Args[2:])
+	case "assign-lanes":
+		runAssignLanes(os.Args[2:])
+	case "adopt-legacy":
+		runAdoptLegacy(os.Args[2:])
+	case "clear-emergency-stop":
+		runClearEmergencyStop(os.Args[2:])
 	case "takeout":
 		runTakeout(os.Args[2:])
 	default:
@@ -72,6 +79,9 @@ func runImport(args []string) {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)
 	envPath := fs.String("env", "", "path to maintpool env file")
 	sourceDir := fs.String("source-dir", "", "directory containing source auth json files")
+	cohortID := fs.String("cohort-id", "", "logical cohort id for imported auths")
+	sourceBatchID := fs.String("source-batch-id", "", "source batch id for imported auths")
+	lane := fs.String("lane", "", "initial lane; supported value for import is baseline_pending")
 	preview := fs.Bool("preview", false, "evaluate duplicates and would-import entries only")
 	apply := fs.Bool("apply", false, "copy auths into the maintenance pool and write state")
 	_ = fs.Parse(args)
@@ -84,7 +94,103 @@ func runImport(args []string) {
 	fileCount := countJSONFilesOrZero(*sourceDir)
 	ctx, cancel := context.WithTimeout(context.Background(), env.ImportTimeout(fileCount, applyMode))
 	defer cancel()
-	result, err := app.Import(ctx, *sourceDir, applyMode)
+	result, err := app.Import(ctx, *sourceDir, maintpool.ImportOptions{
+		Apply:         applyMode,
+		CohortID:      *cohortID,
+		SourceBatchID: *sourceBatchID,
+		Lane:          *lane,
+	})
+	if err != nil {
+		fatalErr(err)
+	}
+	printJSON(result)
+}
+
+func runAssignLanes(args []string) {
+	fs := flag.NewFlagSet("assign-lanes", flag.ExitOnError)
+	envPath := fs.String("env", "", "path to maintpool env file")
+	cohortID := fs.String("cohort-id", "", "logical cohort id to assign")
+	guard0 := fs.Int("guard-0", 0, "number of ready auths to assign into guard_0")
+	guard1 := fs.Int("guard-1", 0, "number of ready auths to assign into guard_1")
+	guard2 := fs.Int("guard-2", 0, "number of ready auths to assign into guard_2")
+	preview := fs.Bool("preview", false, "show lane assignment plan without mutating state")
+	apply := fs.Bool("apply", false, "persist lane assignment into state")
+	_ = fs.Parse(args)
+
+	if strings.TrimSpace(*cohortID) == "" {
+		fatalf("--cohort-id is required")
+	}
+	app, env := mustLoadApp(*envPath)
+	applyMode := resolveMode(*preview, *apply)
+	ctx, cancel := context.WithTimeout(context.Background(), env.TakeoutTimeout())
+	defer cancel()
+	result, err := app.AssignLanes(ctx, maintpool.AssignLanesOptions{
+		Apply:    applyMode,
+		CohortID: *cohortID,
+		Guard0:   *guard0,
+		Guard1:   *guard1,
+		Guard2:   *guard2,
+	})
+	if err != nil {
+		fatalErr(err)
+	}
+	printJSON(result)
+}
+
+func runAdoptLegacy(args []string) {
+	fs := flag.NewFlagSet("adopt-legacy", flag.ExitOnError)
+	envPath := fs.String("env", "", "path to maintpool env file")
+	cohortID := fs.String("cohort-id", "", "logical cohort id to assign")
+	sourceBatchID := fs.String("source-batch-id", "", "source batch id to stamp onto adopted legacy auths")
+	guard0 := fs.Int("guard-0", 0, "number of eligible legacy auths to assign into guard_0")
+	guard1 := fs.Int("guard-1", 0, "number of eligible legacy auths to assign into guard_1")
+	guard2 := fs.Int("guard-2", 0, "number of eligible legacy auths to assign into guard_2")
+	requireLastRefreshWithin := fs.Duration("require-last-refresh-within", 72*time.Hour, "only legacy auths with recent last_refresh_ok_at inside this window are eligible")
+	preview := fs.Bool("preview", false, "show adoption plan without mutating state")
+	apply := fs.Bool("apply", false, "persist cohort/lane metadata onto eligible legacy auths")
+	_ = fs.Parse(args)
+
+	if strings.TrimSpace(*cohortID) == "" {
+		fatalf("--cohort-id is required")
+	}
+	if strings.TrimSpace(*sourceBatchID) == "" {
+		fatalf("--source-batch-id is required")
+	}
+	app, env := mustLoadApp(*envPath)
+	applyMode := resolveMode(*preview, *apply)
+	ctx, cancel := context.WithTimeout(context.Background(), env.TakeoutTimeout())
+	defer cancel()
+	result, err := app.AdoptLegacy(ctx, maintpool.AdoptLegacyOptions{
+		Apply:                    applyMode,
+		CohortID:                 *cohortID,
+		SourceBatchID:            *sourceBatchID,
+		Guard0:                   *guard0,
+		Guard1:                   *guard1,
+		Guard2:                   *guard2,
+		RequireLastRefreshWithin: *requireLastRefreshWithin,
+	})
+	if err != nil {
+		fatalErr(err)
+	}
+	printJSON(result)
+}
+
+func runClearEmergencyStop(args []string) {
+	fs := flag.NewFlagSet("clear-emergency-stop", flag.ExitOnError)
+	envPath := fs.String("env", "", "path to maintpool env file")
+	reason := fs.String("reason", "", "operator note explaining why the stop is being cleared")
+	preview := fs.Bool("preview", false, "show current emergency-stop state only")
+	apply := fs.Bool("apply", false, "clear the persisted emergency-stop marker")
+	_ = fs.Parse(args)
+
+	app, env := mustLoadApp(*envPath)
+	applyMode := resolveMode(*preview, *apply)
+	if applyMode && strings.TrimSpace(*reason) == "" {
+		fatalf("--reason is required with --apply")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), env.TakeoutTimeout())
+	defer cancel()
+	result, err := app.ClearEmergencyStop(ctx, *reason, applyMode)
 	if err != nil {
 		fatalErr(err)
 	}

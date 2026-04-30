@@ -18,26 +18,34 @@ import (
 var dayDurationToken = regexp.MustCompile(`([+-]?\d+(?:\.\d+)?)d`)
 
 type EnvConfig struct {
-	Root                   string
-	ConfigPath             string
-	Timezone               string
-	InitialProbeMinDelay   time.Duration
-	InitialProbeMaxDelay   time.Duration
-	InitialRefreshMinDelay time.Duration
-	InitialRefreshMaxDelay time.Duration
-	ProbeMinDelay          time.Duration
-	ProbeMaxDelay          time.Duration
-	RefreshMinDelay        time.Duration
-	RefreshMaxDelay        time.Duration
-	RefreshHardMax         time.Duration
-	Cooldown429            time.Duration
-	CooldownTransient      time.Duration
-	ActionDelayMin         time.Duration
-	ActionDelayMax         time.Duration
-	RefreshChainDelayMin   time.Duration
-	RefreshChainDelayMax   time.Duration
-	ConfirmChainDelayMin   time.Duration
-	ConfirmChainDelayMax   time.Duration
+	Root                                 string
+	ConfigPath                           string
+	Timezone                             string
+	InitialProbeMinDelay                 time.Duration
+	InitialProbeMaxDelay                 time.Duration
+	InitialRefreshMinDelay               time.Duration
+	InitialRefreshMaxDelay               time.Duration
+	ProbeMinDelay                        time.Duration
+	ProbeMaxDelay                        time.Duration
+	RefreshMinDelay                      time.Duration
+	RefreshMaxDelay                      time.Duration
+	RefreshHardMax                       time.Duration
+	Cooldown429                          time.Duration
+	CooldownTransient                    time.Duration
+	ActionDelayMin                       time.Duration
+	ActionDelayMax                       time.Duration
+	RefreshChainDelayMin                 time.Duration
+	RefreshChainDelayMax                 time.Duration
+	ConfirmChainDelayMin                 time.Duration
+	ConfirmChainDelayMax                 time.Duration
+	ManagedUpstreamSafeRefreshDelay      time.Duration
+	ManagedMainBufferMin                 time.Duration
+	ManagedMainBufferMax                 time.Duration
+	ManagedGuard0Offset                  time.Duration
+	ManagedGuard1Offset                  time.Duration
+	ManagedGuard2Offset                  time.Duration
+	ManagedGuardJitterMax                time.Duration
+	EmergencyConsecutiveInvalidThreshold int
 }
 
 func LoadEnvConfig(envPath string) (*EnvConfig, error) {
@@ -46,26 +54,34 @@ func LoadEnvConfig(envPath string) (*EnvConfig, error) {
 		return nil, fmt.Errorf("load maintpool env %q: %w", envPath, err)
 	}
 	cfg := &EnvConfig{
-		Root:                   strings.TrimSpace(values["ROOT"]),
-		ConfigPath:             strings.TrimSpace(values["CONFIG"]),
-		Timezone:               strings.TrimSpace(values["TZ"]),
-		InitialProbeMinDelay:   parseEnvDuration(values, "INITIAL_PROBE_MIN_DELAY", 60*24*time.Hour),
-		InitialProbeMaxDelay:   parseEnvDuration(values, "INITIAL_PROBE_MAX_DELAY", 90*24*time.Hour),
-		InitialRefreshMinDelay: parseEnvDuration(values, "INITIAL_REFRESH_MIN_DELAY", 20*24*time.Hour),
-		InitialRefreshMaxDelay: parseEnvDuration(values, "INITIAL_REFRESH_MAX_DELAY", 35*24*time.Hour),
-		ProbeMinDelay:          parseEnvDuration(values, "PROBE_MIN_DELAY", 60*24*time.Hour),
-		ProbeMaxDelay:          parseEnvDuration(values, "PROBE_MAX_DELAY", 90*24*time.Hour),
-		RefreshMinDelay:        parseEnvDuration(values, "REFRESH_MIN_DELAY", 30*24*time.Hour),
-		RefreshMaxDelay:        parseEnvDuration(values, "REFRESH_MAX_DELAY", 34*24*time.Hour),
-		RefreshHardMax:         parseEnvDuration(values, "REFRESH_HARD_MAX", 45*24*time.Hour),
-		Cooldown429:            parseEnvDuration(values, "COOLDOWN_429", 24*time.Hour),
-		CooldownTransient:      parseEnvDuration(values, "COOLDOWN_TRANSIENT", 6*time.Hour),
-		ActionDelayMin:         parseEnvDuration(values, "ACTION_DELAY_MIN", 10*time.Second),
-		ActionDelayMax:         parseEnvDuration(values, "ACTION_DELAY_MAX", 30*time.Second),
-		RefreshChainDelayMin:   parseEnvDuration(values, "REFRESH_CHAIN_DELAY_MIN", 300*time.Millisecond),
-		RefreshChainDelayMax:   parseEnvDuration(values, "REFRESH_CHAIN_DELAY_MAX", 1200*time.Millisecond),
-		ConfirmChainDelayMin:   parseEnvDuration(values, "CONFIRM_CHAIN_DELAY_MIN", 500*time.Millisecond),
-		ConfirmChainDelayMax:   parseEnvDuration(values, "CONFIRM_CHAIN_DELAY_MAX", 1500*time.Millisecond),
+		Root:                                 strings.TrimSpace(values["ROOT"]),
+		ConfigPath:                           strings.TrimSpace(values["CONFIG"]),
+		Timezone:                             strings.TrimSpace(values["TZ"]),
+		InitialProbeMinDelay:                 parseEnvDuration(values, "INITIAL_PROBE_MIN_DELAY", 60*24*time.Hour),
+		InitialProbeMaxDelay:                 parseEnvDuration(values, "INITIAL_PROBE_MAX_DELAY", 90*24*time.Hour),
+		InitialRefreshMinDelay:               parseEnvDuration(values, "INITIAL_REFRESH_MIN_DELAY", 20*24*time.Hour),
+		InitialRefreshMaxDelay:               parseEnvDuration(values, "INITIAL_REFRESH_MAX_DELAY", 35*24*time.Hour),
+		ProbeMinDelay:                        parseEnvDuration(values, "PROBE_MIN_DELAY", 60*24*time.Hour),
+		ProbeMaxDelay:                        parseEnvDuration(values, "PROBE_MAX_DELAY", 90*24*time.Hour),
+		RefreshMinDelay:                      parseEnvDuration(values, "REFRESH_MIN_DELAY", 30*24*time.Hour),
+		RefreshMaxDelay:                      parseEnvDuration(values, "REFRESH_MAX_DELAY", 34*24*time.Hour),
+		RefreshHardMax:                       parseEnvDuration(values, "REFRESH_HARD_MAX", 45*24*time.Hour),
+		Cooldown429:                          parseEnvDuration(values, "COOLDOWN_429", 24*time.Hour),
+		CooldownTransient:                    parseEnvDuration(values, "COOLDOWN_TRANSIENT", 6*time.Hour),
+		ActionDelayMin:                       parseEnvDuration(values, "ACTION_DELAY_MIN", 10*time.Second),
+		ActionDelayMax:                       parseEnvDuration(values, "ACTION_DELAY_MAX", 30*time.Second),
+		RefreshChainDelayMin:                 parseEnvDuration(values, "REFRESH_CHAIN_DELAY_MIN", 300*time.Millisecond),
+		RefreshChainDelayMax:                 parseEnvDuration(values, "REFRESH_CHAIN_DELAY_MAX", 1200*time.Millisecond),
+		ConfirmChainDelayMin:                 parseEnvDuration(values, "CONFIRM_CHAIN_DELAY_MIN", 500*time.Millisecond),
+		ConfirmChainDelayMax:                 parseEnvDuration(values, "CONFIRM_CHAIN_DELAY_MAX", 1500*time.Millisecond),
+		ManagedUpstreamSafeRefreshDelay:      parseEnvDuration(values, "MANAGED_UPSTREAM_SAFE_REFRESH_DELAY", 14*24*time.Hour),
+		ManagedMainBufferMin:                 parseEnvDuration(values, "MANAGED_MAIN_BUFFER_MIN", 3*24*time.Hour),
+		ManagedMainBufferMax:                 parseEnvDuration(values, "MANAGED_MAIN_BUFFER_MAX", 4*24*time.Hour),
+		ManagedGuard0Offset:                  parseEnvDuration(values, "MANAGED_GUARD_0_OFFSET", 0),
+		ManagedGuard1Offset:                  parseEnvDuration(values, "MANAGED_GUARD_1_OFFSET", 24*time.Hour),
+		ManagedGuard2Offset:                  parseEnvDuration(values, "MANAGED_GUARD_2_OFFSET", 48*time.Hour),
+		ManagedGuardJitterMax:                parseEnvDuration(values, "MANAGED_GUARD_JITTER_MAX", 6*time.Hour),
+		EmergencyConsecutiveInvalidThreshold: parseEnvInt(values, "EMERGENCY_CONSECUTIVE_INVALID_THRESHOLD", 3),
 	}
 	if cfg.Timezone == "" {
 		cfg.Timezone = "Asia/Shanghai"
@@ -120,6 +136,30 @@ func (c *EnvConfig) Validate() error {
 	}
 	if err := ensureNonNegativeWindow("CONFIRM_CHAIN_DELAY", c.ConfirmChainDelayMin, c.ConfirmChainDelayMax); err != nil {
 		return err
+	}
+	if c.ManagedUpstreamSafeRefreshDelay <= 0 {
+		return fmt.Errorf("MANAGED_UPSTREAM_SAFE_REFRESH_DELAY must be > 0")
+	}
+	if err := ensureNonNegativeWindow("MANAGED_MAIN_BUFFER", c.ManagedMainBufferMin, c.ManagedMainBufferMax); err != nil {
+		return err
+	}
+	if c.ManagedUpstreamSafeRefreshDelay <= c.ManagedMainBufferMax {
+		return fmt.Errorf("MANAGED_UPSTREAM_SAFE_REFRESH_DELAY must be > MANAGED_MAIN_BUFFER_MAX")
+	}
+	if c.ManagedGuard0Offset < 0 || c.ManagedGuard1Offset < 0 || c.ManagedGuard2Offset < 0 {
+		return fmt.Errorf("MANAGED_GUARD_<n>_OFFSET must be >= 0")
+	}
+	if c.ManagedGuard1Offset < c.ManagedGuard0Offset {
+		return fmt.Errorf("MANAGED_GUARD_1_OFFSET must be >= MANAGED_GUARD_0_OFFSET")
+	}
+	if c.ManagedGuard2Offset < c.ManagedGuard1Offset {
+		return fmt.Errorf("MANAGED_GUARD_2_OFFSET must be >= MANAGED_GUARD_1_OFFSET")
+	}
+	if c.ManagedGuardJitterMax < 0 {
+		return fmt.Errorf("MANAGED_GUARD_JITTER_MAX must be >= 0")
+	}
+	if c.EmergencyConsecutiveInvalidThreshold < 0 {
+		return fmt.Errorf("EMERGENCY_CONSECUTIVE_INVALID_THRESHOLD must be >= 0")
 	}
 	return nil
 }
@@ -206,6 +246,10 @@ func (c *EnvConfig) LockPath() string {
 	return filepath.Join(c.StateDir(), "maintpool.lock")
 }
 
+func (c *EnvConfig) EmergencyStopPath() string {
+	return filepath.Join(c.StateDir(), "maintpool-emergency-stop.json")
+}
+
 func (c *EnvConfig) StatusTimeout() time.Duration {
 	return 2 * time.Minute
 }
@@ -246,12 +290,82 @@ func (c *EnvConfig) ScanTimeout(limit int, apply bool) time.Duration {
 	return total
 }
 
+func (c *EnvConfig) ManagedMainRefreshMinDelay() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.ManagedUpstreamSafeRefreshDelay - c.ManagedMainBufferMax
+}
+
+func (c *EnvConfig) ManagedMainRefreshMaxDelay() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.ManagedUpstreamSafeRefreshDelay - c.ManagedMainBufferMin
+}
+
+func (c *EnvConfig) ManagedMainRefreshHardMax() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.ManagedUpstreamSafeRefreshDelay
+}
+
+func (c *EnvConfig) ManagedGuardDelay(lane string) (time.Duration, time.Duration, bool) {
+	if c == nil {
+		return 0, 0, false
+	}
+	offset, ok := c.ManagedGuardOffset(lane)
+	if !ok {
+		return 0, 0, false
+	}
+	minDelay := c.ManagedUpstreamSafeRefreshDelay + offset
+	maxDelay := minDelay + c.ManagedGuardJitterMax
+	return minDelay, maxDelay, true
+}
+
+func (c *EnvConfig) ManagedGuardOffset(lane string) (time.Duration, bool) {
+	if c == nil {
+		return 0, false
+	}
+	switch strings.ToLower(strings.TrimSpace(lane)) {
+	case laneGuard0:
+		return c.ManagedGuard0Offset, true
+	case laneGuard1:
+		return c.ManagedGuard1Offset, true
+	case laneGuard2:
+		return c.ManagedGuard2Offset, true
+	default:
+		return 0, false
+	}
+}
+
+func (c *EnvConfig) ManagedGuardHardMax(lane string) time.Duration {
+	_, maxDelay, ok := c.ManagedGuardDelay(lane)
+	if !ok {
+		return 0
+	}
+	return maxDelay
+}
+
 func parseEnvDuration(values map[string]string, key string, fallback time.Duration) time.Duration {
 	raw := strings.TrimSpace(values[key])
 	if raw == "" {
 		return fallback
 	}
 	parsed, err := parseFlexibleDuration(raw)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseEnvInt(values map[string]string, key string, fallback int) int {
+	raw := strings.TrimSpace(values[key])
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(raw)
 	if err != nil {
 		return fallback
 	}

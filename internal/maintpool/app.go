@@ -36,22 +36,37 @@ const (
 	missingStateRefreshMinDelay = 12 * time.Hour
 	missingStateRefreshMaxDelay = 48 * time.Hour
 
-	resultImported              = "imported"
-	resultTakenOut              = "taken_out"
-	resultProbeOK               = "probe_ok"
-	resultScheduledRefreshOK    = "scheduled_refresh_ok"
-	resultRecoveryRefreshOK     = "recovery_refresh_ok"
-	resultUsage429              = "usage_429"
-	resultProbeError            = "probe_error"
-	resultInvalidMoved          = "invalid_moved"
-	resultScheduledRefresh429   = "scheduled_refresh_429"
-	resultScheduledRefreshError = "scheduled_refresh_error"
-	resultRecoveryRefresh429    = "recovery_refresh_429"
-	resultRecoveryRefreshError  = "recovery_refresh_error"
-	resultScheduledConfirm429   = "scheduled_confirm_429"
-	resultScheduledConfirmError = "scheduled_confirm_error"
-	resultRecoveryConfirm429    = "recovery_confirm_429"
-	resultRecoveryConfirmError  = "recovery_confirm_error"
+	resultImported               = "imported"
+	resultLaneAssigned           = "lane_assigned"
+	resultLegacyAdopted          = "legacy_adopted"
+	resultTakenOut               = "taken_out"
+	resultProbeOK                = "probe_ok"
+	resultScheduledRefreshOK     = "scheduled_refresh_ok"
+	resultRecoveryRefreshOK      = "recovery_refresh_ok"
+	resultUsage429               = "usage_429"
+	resultProbeError             = "probe_error"
+	resultInvalidMoved           = "invalid_moved"
+	resultScheduledRefresh429    = "scheduled_refresh_429"
+	resultScheduledRefreshError  = "scheduled_refresh_error"
+	resultRecoveryRefresh429     = "recovery_refresh_429"
+	resultRecoveryRefreshError   = "recovery_refresh_error"
+	resultScheduledConfirm429    = "scheduled_confirm_429"
+	resultScheduledConfirmError  = "scheduled_confirm_error"
+	resultRecoveryConfirm429     = "recovery_confirm_429"
+	resultRecoveryConfirmError   = "recovery_confirm_error"
+	resultEmergencyStopCleared   = "emergency_stop_cleared"
+	resultEmergencyStopTriggered = "emergency_stop_triggered"
+
+	laneLegacy          = "legacy"
+	laneMain            = "main"
+	laneGuard0          = "guard_0"
+	laneGuard1          = "guard_1"
+	laneGuard2          = "guard_2"
+	laneBaselinePending = "baseline_pending"
+
+	baselineStatePending            = "pending"
+	baselineStateReadyForAssignment = "ready_for_assignment"
+	baselineStateAdmitted           = "admitted"
 )
 
 type App struct {
@@ -131,29 +146,53 @@ func (a *App) Status(ctx context.Context) (*StatusResult, error) {
 		GeneratedAt: now,
 		Root:        a.env.Root,
 		Paths: StatusPaths{
-			PoolDir:        a.env.PoolDir(),
-			StatePath:      a.env.StatePath(),
-			EventsPath:     a.env.EventsPath(),
-			External401Dir: a.env.External401Dir(),
-			ExportedDir:    a.env.ExportedDir(),
+			PoolDir:           a.env.PoolDir(),
+			StatePath:         a.env.StatePath(),
+			EventsPath:        a.env.EventsPath(),
+			External401Dir:    a.env.External401Dir(),
+			ExportedDir:       a.env.ExportedDir(),
+			EmergencyStopPath: a.env.EmergencyStopPath(),
 		},
 		Cadence: StatusCadence{
-			InitialProbeMinDelay:   a.env.InitialProbeMinDelay,
-			InitialProbeMaxDelay:   a.env.InitialProbeMaxDelay,
-			InitialRefreshMinDelay: a.env.InitialRefreshMinDelay,
-			InitialRefreshMaxDelay: a.env.InitialRefreshMaxDelay,
-			ProbeMinDelay:          a.env.ProbeMinDelay,
-			ProbeMaxDelay:          a.env.ProbeMaxDelay,
-			RefreshMinDelay:        a.env.RefreshMinDelay,
-			RefreshMaxDelay:        a.env.RefreshMaxDelay,
-			RefreshHardMax:         a.env.RefreshHardMax,
-			Cooldown429:            a.env.Cooldown429,
-			CooldownTransient:      a.env.CooldownTransient,
+			InitialProbeMinDelay:            a.env.InitialProbeMinDelay,
+			InitialProbeMaxDelay:            a.env.InitialProbeMaxDelay,
+			InitialRefreshMinDelay:          a.env.InitialRefreshMinDelay,
+			InitialRefreshMaxDelay:          a.env.InitialRefreshMaxDelay,
+			ProbeMinDelay:                   a.env.ProbeMinDelay,
+			ProbeMaxDelay:                   a.env.ProbeMaxDelay,
+			RefreshMinDelay:                 a.env.RefreshMinDelay,
+			RefreshMaxDelay:                 a.env.RefreshMaxDelay,
+			RefreshHardMax:                  a.env.RefreshHardMax,
+			Cooldown429:                     a.env.Cooldown429,
+			CooldownTransient:               a.env.CooldownTransient,
+			ManagedUpstreamSafeRefreshDelay: a.env.ManagedUpstreamSafeRefreshDelay,
+			ManagedMainBufferMin:            a.env.ManagedMainBufferMin,
+			ManagedMainBufferMax:            a.env.ManagedMainBufferMax,
+			ManagedGuard0Offset:             a.env.ManagedGuard0Offset,
+			ManagedGuard1Offset:             a.env.ManagedGuard1Offset,
+			ManagedGuard2Offset:             a.env.ManagedGuard2Offset,
+			ManagedGuardJitterMax:           a.env.ManagedGuardJitterMax,
+		},
+		Guardrails: StatusGuardrails{
+			EmergencyConsecutiveInvalidThreshold: a.env.EmergencyConsecutiveInvalidThreshold,
 		},
 	}
+	result.Pool.ByLane = map[string]int{}
+	result.Pool.ByBaselineState = map[string]int{}
+	emergencyStop, err := a.loadEmergencyStop()
+	if err != nil {
+		return nil, err
+	}
+	result.EmergencyStop = *emergencyStop
 	result.Pool.TotalFiles = len(auths)
 	for _, authEntry := range auths {
 		entry := effectiveStateForAuth(authEntry, state.Files[baseName(authEntry.FileName)], now)
+		if lane := effectiveDisplayLane(entry); lane != "" {
+			result.Pool.ByLane[lane]++
+		}
+		if baselineState := effectiveBaselineState(entry); baselineState != "" {
+			result.Pool.ByBaselineState[baselineState]++
+		}
 		if observedAt := authObservedAt(authEntry); !observedAt.IsZero() {
 			if result.Pool.OldestKnownAuthAt.IsZero() || observedAt.Before(result.Pool.OldestKnownAuthAt) {
 				result.Pool.OldestKnownAuthAt = observedAt
@@ -164,8 +203,11 @@ func (a *App) Status(ctx context.Context) (*StatusResult, error) {
 				result.Pool.OldestImportedAt = entry.ImportedAt
 			}
 		}
+		if entryAwaitingLaneAssignment(entry) {
+			continue
+		}
 		dueProbe := isProbeDue(entry, now)
-		dueRefresh := isRefreshDue(entry, now, a.env.RefreshHardMax)
+		dueRefresh := isRefreshDue(entry, now, a.effectiveRefreshHardMax(entry))
 		if entry != nil && entry.CooldownUntil.After(now) {
 			result.Pool.Cooling++
 			continue
@@ -179,7 +221,7 @@ func (a *App) Status(ctx context.Context) (*StatusResult, error) {
 		if dueRefresh {
 			result.Pool.DueRefreshNow++
 		}
-		dueAt := effectiveDueAt(entry, now, a.env.RefreshHardMax)
+		dueAt := effectiveDueAt(entry, now, a.effectiveRefreshHardMax(entry))
 		if !dueAt.IsZero() && (result.Pool.NextDueAt.IsZero() || dueAt.Before(result.Pool.NextDueAt)) {
 			result.Pool.NextDueAt = dueAt
 		}
@@ -189,7 +231,11 @@ func (a *App) Status(ctx context.Context) (*StatusResult, error) {
 	return result, nil
 }
 
-func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*ImportResult, error) {
+func (a *App) Import(ctx context.Context, sourceDir string, options ImportOptions) (*ImportResult, error) {
+	normalizedOptions, err := normalizeImportOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	sourceDir = strings.TrimSpace(sourceDir)
 	if sourceDir == "" {
 		return nil, fmt.Errorf("source dir is required")
@@ -199,8 +245,11 @@ func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*Import
 		return nil, err
 	}
 	result := &ImportResult{
-		Mode:            modeLabel(apply),
+		Mode:            modeLabel(normalizedOptions.Apply),
 		SourceDir:       resolvedSource,
+		CohortID:        normalizedOptions.CohortID,
+		SourceBatchID:   normalizedOptions.SourceBatchID,
+		Lane:            normalizedOptions.Lane,
 		ResultListLimit: resultListLimit,
 		Imported:        make([]string, 0, resultListLimit),
 		Skipped:         make([]ImportSkip, 0, resultListLimit),
@@ -214,8 +263,8 @@ func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*Import
 		return nil, err
 	}
 
-	err = a.withOptionalLock(apply, func() error {
-		if apply {
+	err = a.withOptionalLock(normalizedOptions.Apply, func() error {
+		if normalizedOptions.Apply {
 			if errEnsure := a.env.EnsureDirectories(); errEnsure != nil {
 				return errEnsure
 			}
@@ -245,7 +294,7 @@ func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*Import
 				continue
 			}
 
-			if !apply {
+			if !normalizedOptions.Apply {
 				result.Summary.Imported++
 				var truncated bool
 				result.Imported, truncated = appendName(result.Imported, name)
@@ -275,7 +324,7 @@ func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*Import
 			importedTargets = append(importedTargets, savedPath)
 
 			entry := ensureStateEntry(state, name)
-			initializeImportedState(a, entry, current, now)
+			initializeImportedState(a, entry, current, now, normalizedOptions)
 			dupIndex.add(current)
 			result.Summary.Imported++
 			var truncated bool
@@ -292,7 +341,7 @@ func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*Import
 			})
 		}
 
-		if !apply {
+		if !normalizedOptions.Apply {
 			return nil
 		}
 		if errSaveState := a.saveState(state); errSaveState != nil {
@@ -307,6 +356,335 @@ func (a *App) Import(ctx context.Context, sourceDir string, apply bool) (*Import
 			}
 			return fmt.Errorf("append import events: %w", errAppend)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (a *App) AssignLanes(ctx context.Context, options AssignLanesOptions) (*AssignLanesResult, error) {
+	normalizedOptions, err := normalizeAssignLanesOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	result := &AssignLanesResult{
+		Mode:            modeLabel(normalizedOptions.Apply),
+		CohortID:        normalizedOptions.CohortID,
+		ResultListLimit: resultListLimit,
+		Main:            make([]string, 0, resultListLimit),
+		Guard0:          make([]string, 0, resultListLimit),
+		Guard1:          make([]string, 0, resultListLimit),
+		Guard2:          make([]string, 0, resultListLimit),
+		Skipped:         make([]AssignLaneSkip, 0, resultListLimit),
+	}
+
+	err = a.withOptionalLock(normalizedOptions.Apply, func() error {
+		state, errLoadState := a.loadState()
+		if errLoadState != nil {
+			return errLoadState
+		}
+		auths, errList := a.listPoolAuths(ctx)
+		if errList != nil {
+			return errList
+		}
+		pruneMissingStateEntries(state, auths)
+
+		type laneAssignmentTarget struct {
+			auth  *coreauth.Auth
+			entry *FileState
+			name  string
+		}
+
+		ready := make([]laneAssignmentTarget, 0)
+		for _, authEntry := range auths {
+			name := baseName(authEntry.FileName)
+			entry := state.Files[name]
+			if entry == nil || !strings.EqualFold(strings.TrimSpace(entry.CohortID), normalizedOptions.CohortID) {
+				continue
+			}
+			result.Summary.CohortMatched++
+			if canonicalStoredLane(entry) != laneBaselinePending {
+				result.Summary.SkippedNotReady++
+				result.SkippedTruncated = appendAssignLaneSkip(result, AssignLaneSkip{Name: name, Reason: "lane_not_baseline_pending"}) || result.SkippedTruncated
+				continue
+			}
+			if effectiveBaselineState(entry) != baselineStateReadyForAssignment {
+				result.Summary.SkippedNotReady++
+				result.SkippedTruncated = appendAssignLaneSkip(result, AssignLaneSkip{Name: name, Reason: "baseline_not_ready_for_assignment"}) || result.SkippedTruncated
+				continue
+			}
+			if baselineAssignmentAnchor(entry).IsZero() {
+				result.Summary.SkippedMissingAnchor++
+				result.SkippedTruncated = appendAssignLaneSkip(result, AssignLaneSkip{Name: name, Reason: "missing_baseline_refresh_ok_at"}) || result.SkippedTruncated
+				continue
+			}
+			result.Summary.ReadyForAssignment++
+			ready = append(ready, laneAssignmentTarget{
+				auth:  authEntry,
+				entry: entry,
+				name:  name,
+			})
+		}
+
+		requestedSentinels := normalizedOptions.Guard0 + normalizedOptions.Guard1 + normalizedOptions.Guard2
+		if requestedSentinels > len(ready) {
+			return fmt.Errorf("cohort %q only has %d ready auths, but %d sentinel slots were requested", normalizedOptions.CohortID, len(ready), requestedSentinels)
+		}
+
+		sort.Slice(ready, func(i, j int) bool {
+			leftKey := assignmentSortKey(normalizedOptions.CohortID, ready[i].auth)
+			rightKey := assignmentSortKey(normalizedOptions.CohortID, ready[j].auth)
+			if leftKey != rightKey {
+				return leftKey < rightKey
+			}
+			return strings.ToLower(ready[i].name) < strings.ToLower(ready[j].name)
+		})
+
+		plannedEvents := make([]Event, 0, len(ready))
+		nextIndex := 0
+		appendTargets := func(targets []laneAssignmentTarget, lane string, list *[]string, truncated *bool, summaryCounter *int) {
+			for _, target := range targets {
+				*summaryCounter = *summaryCounter + 1
+				var wasTruncated bool
+				*list, wasTruncated = appendName(*list, target.name)
+				*truncated = *truncated || wasTruncated
+				if !normalizedOptions.Apply {
+					continue
+				}
+				assignedAt := a.now()
+				target.entry.Lane = lane
+				target.entry.BaselineState = baselineStateAdmitted
+				target.entry.LaneAssignedAt = assignedAt
+				target.entry.NextRefreshDueAt = a.managedLaneDueAt(lane, baselineAssignmentAnchor(target.entry), target.auth)
+				plannedEvents = append(plannedEvents, Event{
+					At:        assignedAt,
+					Type:      resultLaneAssigned,
+					Name:      target.name,
+					Email:     target.entry.Email,
+					AccountID: target.entry.AccountID,
+					Reason:    fmt.Sprintf("cohort_id=%s lane=%s", normalizedOptions.CohortID, lane),
+				})
+			}
+		}
+
+		assignRange := func(count int) []laneAssignmentTarget {
+			if count <= 0 {
+				return nil
+			}
+			start := nextIndex
+			end := nextIndex + count
+			nextIndex = end
+			return ready[start:end]
+		}
+
+		appendTargets(assignRange(normalizedOptions.Guard0), laneGuard0, &result.Guard0, &result.Guard0Truncated, &result.Summary.AssignedGuard0)
+		appendTargets(assignRange(normalizedOptions.Guard1), laneGuard1, &result.Guard1, &result.Guard1Truncated, &result.Summary.AssignedGuard1)
+		appendTargets(assignRange(normalizedOptions.Guard2), laneGuard2, &result.Guard2, &result.Guard2Truncated, &result.Summary.AssignedGuard2)
+		appendTargets(ready[nextIndex:], laneMain, &result.Main, &result.MainTruncated, &result.Summary.AssignedMain)
+
+		if !normalizedOptions.Apply {
+			return nil
+		}
+		if errSaveState := a.saveState(state); errSaveState != nil {
+			return errSaveState
+		}
+		return a.appendEvents(plannedEvents)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (a *App) AdoptLegacy(ctx context.Context, options AdoptLegacyOptions) (*AdoptLegacyResult, error) {
+	normalizedOptions, err := normalizeAdoptLegacyOptions(options)
+	if err != nil {
+		return nil, err
+	}
+	result := &AdoptLegacyResult{
+		Mode:                     modeLabel(normalizedOptions.Apply),
+		CohortID:                 normalizedOptions.CohortID,
+		SourceBatchID:            normalizedOptions.SourceBatchID,
+		RequireLastRefreshWithin: normalizedOptions.RequireLastRefreshWithin,
+		ResultListLimit:          resultListLimit,
+		Main:                     make([]string, 0, resultListLimit),
+		Guard0:                   make([]string, 0, resultListLimit),
+		Guard1:                   make([]string, 0, resultListLimit),
+		Guard2:                   make([]string, 0, resultListLimit),
+		Skipped:                  make([]AssignLaneSkip, 0, resultListLimit),
+	}
+
+	err = a.withOptionalLock(normalizedOptions.Apply, func() error {
+		state, errLoadState := a.loadState()
+		if errLoadState != nil {
+			return errLoadState
+		}
+		auths, errList := a.listPoolAuths(ctx)
+		if errList != nil {
+			return errList
+		}
+		pruneMissingStateEntries(state, auths)
+
+		type laneAssignmentTarget struct {
+			auth  *coreauth.Auth
+			entry *FileState
+			name  string
+		}
+
+		now := a.now()
+		cutoff := now.Add(-normalizedOptions.RequireLastRefreshWithin)
+		eligible := make([]laneAssignmentTarget, 0)
+		for _, authEntry := range auths {
+			name := baseName(authEntry.FileName)
+			entry := state.Files[name]
+			if !isUnmanagedLegacyEntry(entry) {
+				continue
+			}
+			result.Summary.LegacyMatched++
+			if entry == nil || entry.LastRefreshOKAt.IsZero() {
+				result.Summary.SkippedMissingAnchor++
+				result.SkippedTruncated = appendAdoptLegacySkip(result, AssignLaneSkip{Name: name, Reason: "missing_last_refresh_ok_at"}) || result.SkippedTruncated
+				continue
+			}
+			if entry.LastRefreshOKAt.Before(cutoff) {
+				result.Summary.SkippedTooOld++
+				result.SkippedTruncated = appendAdoptLegacySkip(result, AssignLaneSkip{Name: name, Reason: "last_refresh_ok_too_old"}) || result.SkippedTruncated
+				continue
+			}
+			result.Summary.Eligible++
+			eligible = append(eligible, laneAssignmentTarget{
+				auth:  authEntry,
+				entry: entry,
+				name:  name,
+			})
+		}
+
+		requestedSentinels := normalizedOptions.Guard0 + normalizedOptions.Guard1 + normalizedOptions.Guard2
+		if requestedSentinels > len(eligible) {
+			return fmt.Errorf("only %d eligible legacy auths matched, but %d sentinel slots were requested", len(eligible), requestedSentinels)
+		}
+
+		sort.Slice(eligible, func(i, j int) bool {
+			leftKey := assignmentSortKey(normalizedOptions.CohortID, eligible[i].auth)
+			rightKey := assignmentSortKey(normalizedOptions.CohortID, eligible[j].auth)
+			if leftKey != rightKey {
+				return leftKey < rightKey
+			}
+			return strings.ToLower(eligible[i].name) < strings.ToLower(eligible[j].name)
+		})
+
+		plannedEvents := make([]Event, 0, len(eligible))
+		nextIndex := 0
+		appendTargets := func(targets []laneAssignmentTarget, lane string, list *[]string, truncated *bool, summaryCounter *int) {
+			for _, target := range targets {
+				*summaryCounter = *summaryCounter + 1
+				var wasTruncated bool
+				*list, wasTruncated = appendName(*list, target.name)
+				*truncated = *truncated || wasTruncated
+				if !normalizedOptions.Apply {
+					continue
+				}
+				adoptedAt := a.now()
+				target.entry.CohortID = normalizedOptions.CohortID
+				target.entry.SourceBatchID = normalizedOptions.SourceBatchID
+				target.entry.Lane = lane
+				target.entry.BaselineState = baselineStateAdmitted
+				if target.entry.BaselineRefreshOKAt.IsZero() {
+					target.entry.BaselineRefreshOKAt = target.entry.LastRefreshOKAt
+				}
+				target.entry.LaneAssignedAt = adoptedAt
+				target.entry.NextRefreshDueAt = a.managedLaneDueAt(lane, baselineAssignmentAnchor(target.entry), target.auth)
+				if target.entry.NextProbeAt.IsZero() || !target.entry.NextProbeAt.After(adoptedAt) {
+					target.entry.NextProbeAt = target.entry.LastRefreshOKAt.Add(a.nextProbeDelay())
+					if !target.entry.NextProbeAt.After(adoptedAt) {
+						target.entry.NextProbeAt = adoptedAt.Add(a.nextProbeDelay())
+					}
+				}
+				plannedEvents = append(plannedEvents, Event{
+					At:        adoptedAt,
+					Type:      resultLegacyAdopted,
+					Name:      target.name,
+					Email:     target.entry.Email,
+					AccountID: target.entry.AccountID,
+					Reason: fmt.Sprintf(
+						"cohort_id=%s source_batch_id=%s lane=%s",
+						normalizedOptions.CohortID,
+						normalizedOptions.SourceBatchID,
+						lane,
+					),
+				})
+			}
+		}
+
+		assignRange := func(count int) []laneAssignmentTarget {
+			if count <= 0 {
+				return nil
+			}
+			start := nextIndex
+			end := nextIndex + count
+			nextIndex = end
+			return eligible[start:end]
+		}
+
+		appendTargets(assignRange(normalizedOptions.Guard0), laneGuard0, &result.Guard0, &result.Guard0Truncated, &result.Summary.AssignedGuard0)
+		appendTargets(assignRange(normalizedOptions.Guard1), laneGuard1, &result.Guard1, &result.Guard1Truncated, &result.Summary.AssignedGuard1)
+		appendTargets(assignRange(normalizedOptions.Guard2), laneGuard2, &result.Guard2, &result.Guard2Truncated, &result.Summary.AssignedGuard2)
+		appendTargets(eligible[nextIndex:], laneMain, &result.Main, &result.MainTruncated, &result.Summary.AssignedMain)
+
+		if !normalizedOptions.Apply {
+			return nil
+		}
+		if errSaveState := a.saveState(state); errSaveState != nil {
+			return errSaveState
+		}
+		return a.appendEvents(plannedEvents)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (a *App) ClearEmergencyStop(_ context.Context, reason string, apply bool) (*ClearEmergencyStopResult, error) {
+	result := &ClearEmergencyStopResult{
+		Mode:   modeLabel(apply),
+		Reason: trimReason(reason),
+	}
+
+	err := a.withOptionalLock(apply, func() error {
+		previous, errLoad := a.loadEmergencyStop()
+		if errLoad != nil {
+			return errLoad
+		}
+		result.Previous = cloneEmergencyStop(previous)
+		result.HadStop = previous.Active
+		current := &StatusEmergencyStop{
+			Active:    false,
+			Threshold: a.env.EmergencyConsecutiveInvalidThreshold,
+		}
+		result.Current = cloneEmergencyStop(current)
+		if !apply || !result.HadStop {
+			return nil
+		}
+		if strings.TrimSpace(reason) == "" {
+			return fmt.Errorf("reason is required with --apply")
+		}
+		if errSave := a.saveEmergencyStop(current); errSave != nil {
+			return errSave
+		}
+		if errAppend := a.appendEvents([]Event{{
+			At:     a.now(),
+			Type:   resultEmergencyStopCleared,
+			Reason: trimReason(reason),
+		}}); errAppend != nil {
+			if rollbackErr := a.saveEmergencyStop(previous); rollbackErr != nil {
+				return fmt.Errorf("append clear-emergency-stop event: %w; rollback failed: %v", errAppend, rollbackErr)
+			}
+			return fmt.Errorf("append clear-emergency-stop event: %w", errAppend)
+		}
+		result.Cleared = true
 		return nil
 	})
 	if err != nil {
@@ -425,6 +803,13 @@ func (a *App) Scan(ctx context.Context, apply bool, limit int) (*ScanResult, err
 			return errList
 		}
 		pruneMissingStateEntries(state, auths)
+		emergencyStop, errEmergency := a.loadEmergencyStop()
+		if errEmergency != nil {
+			return errEmergency
+		}
+		if emergencyStop.Active || emergencyStop.Threshold > 0 {
+			result.EmergencyStop = emergencyStop
+		}
 
 		candidates := a.selectDueCandidates(auths, state, limit)
 		result.Summary.Selected = len(candidates)
@@ -436,18 +821,56 @@ func (a *App) Scan(ctx context.Context, apply bool, limit int) (*ScanResult, err
 		if !apply {
 			return nil
 		}
+		if emergencyStop.Active {
+			result.Summary.EmergencyStopActive = true
+			return nil
+		}
 
 		events := make([]Event, 0, len(candidates))
+		consecutiveInvalid401 := 0
 		for index, candidate := range candidates {
 			if errWait := a.waitBetweenAuths(ctx, index); errWait != nil {
 				return errWait
 			}
+			eventCountBefore := len(events)
 			removed, errProcess := a.processDueAuth(ctx, candidate, state, &result.Summary, &events)
 			if errProcess != nil {
 				return errProcess
 			}
 			if removed {
 				delete(state.Files, baseName(candidate.auth.FileName))
+			}
+			if len(events) <= eventCountBefore {
+				consecutiveInvalid401 = 0
+				continue
+			}
+			lastEvent := events[len(events)-1]
+			if lastEvent.Type != resultInvalidMoved {
+				consecutiveInvalid401 = 0
+				continue
+			}
+			consecutiveInvalid401++
+			if consecutiveInvalid401 > result.Summary.ConsecutiveInvalid401 {
+				result.Summary.ConsecutiveInvalid401 = consecutiveInvalid401
+			}
+			if a.env.EmergencyConsecutiveInvalidThreshold > 0 && consecutiveInvalid401 >= a.env.EmergencyConsecutiveInvalidThreshold {
+				stop := a.buildEmergencyStop(lastEvent, consecutiveInvalid401)
+				if errSaveStop := a.saveEmergencyStop(stop); errSaveStop != nil {
+					return errSaveStop
+				}
+				result.EmergencyStop = stop
+				result.Summary.EmergencyStopTriggered = true
+				result.Summary.EmergencyStopActive = true
+				events = append(events, Event{
+					At:         stop.TriggeredAt,
+					Type:       resultEmergencyStopTriggered,
+					Name:       stop.LastAuthName,
+					Email:      stop.LastEmail,
+					AccountID:  stop.LastAccountID,
+					Reason:     stop.Reason,
+					HTTPStatus: stop.LastHTTPStatus,
+				})
+				break
 			}
 		}
 
@@ -635,6 +1058,33 @@ func (a *App) handleRefreshPath(ctx context.Context, current *coreauth.Auth, ent
 	entry.LastRefreshOKAt = refreshTime
 	populateStateIdentity(entry, refreshed)
 
+	if !a.shouldConfirmAfterRefresh(entry, scheduled) {
+		entry.LastHTTPStatus = 0
+		entry.CooldownUntil = time.Time{}
+		// Keep an overdue standalone audit due soon after a no-confirm main refresh
+		// instead of silently pushing it out by another full 60d-90d window.
+		if entry.NextProbeAt.IsZero() {
+			entry.NextProbeAt = refreshTime
+		}
+		entry.NextRefreshDueAt = a.nextRefreshDueAfterConfirmedRefresh(entry, refreshed, refreshTime)
+		if scheduled {
+			entry.LastResult = resultScheduledRefreshOK
+			summary.ScheduledRefreshOK++
+		} else {
+			entry.LastResult = resultRecoveryRefreshOK
+			summary.RecoveryRefreshOK++
+		}
+		summary.Processed++
+		*events = append(*events, Event{
+			At:        refreshTime,
+			Type:      entry.LastResult,
+			Name:      baseName(refreshed.FileName),
+			Email:     entry.Email,
+			AccountID: entry.AccountID,
+		})
+		return false, nil
+	}
+
 	if err := a.waitBetweenChainSteps(ctx, a.nextConfirmChainDelay()); err != nil {
 		return false, err
 	}
@@ -653,7 +1103,16 @@ func (a *App) handleRefreshPath(ctx context.Context, current *coreauth.Auth, ent
 		if entry.NextProbeAt.IsZero() || !entry.NextProbeAt.After(confirmTime) {
 			entry.NextProbeAt = confirmTime.Add(a.nextProbeDelay())
 		}
-		entry.NextRefreshDueAt = refreshTime.Add(a.nextRefreshDelay())
+		if baselineLanePending(entry) {
+			entry.BaselineRefreshOKAt = refreshTime
+			entry.BaselineState = baselineStateReadyForAssignment
+			entry.NextRefreshDueAt = time.Time{}
+		} else {
+			if promoteManagedGuardLane(entry, confirmTime) {
+				entry.BaselineState = baselineStateAdmitted
+			}
+			entry.NextRefreshDueAt = a.nextRefreshDueAfterConfirmedRefresh(entry, refreshed, refreshTime)
+		}
 		if scheduled {
 			entry.LastResult = resultScheduledRefreshOK
 			summary.ScheduledRefreshOK++
@@ -693,7 +1152,7 @@ func (a *App) handleRefreshPath(ctx context.Context, current *coreauth.Auth, ent
 	case classification429:
 		entry.CooldownUntil = confirmTime.Add(a.env.Cooldown429)
 		entry.NextProbeAt = entry.CooldownUntil
-		entry.NextRefreshDueAt = refreshTime.Add(a.nextRefreshDelay())
+		entry.NextRefreshDueAt = a.nextRefreshDueAfterUnconfirmedRefresh(entry, refreshed, refreshTime)
 		if scheduled {
 			entry.LastResult = resultScheduledConfirm429
 		} else {
@@ -714,7 +1173,7 @@ func (a *App) handleRefreshPath(ctx context.Context, current *coreauth.Auth, ent
 	default:
 		entry.CooldownUntil = confirmTime.Add(a.env.CooldownTransient)
 		entry.NextProbeAt = entry.CooldownUntil
-		entry.NextRefreshDueAt = refreshTime.Add(a.nextRefreshDelay())
+		entry.NextRefreshDueAt = a.nextRefreshDueAfterUnconfirmedRefresh(entry, refreshed, refreshTime)
 		if scheduled {
 			entry.LastResult = resultScheduledConfirmError
 		} else {
@@ -740,18 +1199,21 @@ func (a *App) selectDueCandidates(auths []*coreauth.Auth, state *StateFile, limi
 	candidates := make([]dueCandidate, 0, len(auths))
 	for _, authEntry := range auths {
 		entry := effectiveStateForAuth(authEntry, state.Files[baseName(authEntry.FileName)], now)
+		if entryAwaitingLaneAssignment(entry) {
+			continue
+		}
 		if entry != nil && entry.CooldownUntil.After(now) {
 			continue
 		}
 		dueProbe := isProbeDue(entry, now)
-		dueRefresh := isRefreshDue(entry, now, a.env.RefreshHardMax)
+		dueRefresh := isRefreshDue(entry, now, a.effectiveRefreshHardMax(entry))
 		if !dueProbe && !dueRefresh {
 			continue
 		}
 		candidates = append(candidates, dueCandidate{
 			auth:       authEntry,
 			state:      entry,
-			dueAt:      effectiveDueAt(entry, now, a.env.RefreshHardMax),
+			dueAt:      effectiveDueAt(entry, now, a.effectiveRefreshHardMax(entry)),
 			dueProbe:   dueProbe,
 			dueRefresh: dueRefresh,
 		})
@@ -910,6 +1372,58 @@ func (a *App) saveState(state *StateFile) error {
 	return writeJSONAtomic(a.env.StatePath(), state)
 }
 
+func (a *App) loadEmergencyStop() (*StatusEmergencyStop, error) {
+	stop := &StatusEmergencyStop{
+		Active:    false,
+		Threshold: a.env.EmergencyConsecutiveInvalidThreshold,
+	}
+	raw, err := os.ReadFile(a.env.EmergencyStopPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return stop, nil
+		}
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return stop, nil
+	}
+	if err := json.Unmarshal(raw, stop); err != nil {
+		return nil, err
+	}
+	if stop.Threshold == 0 {
+		stop.Threshold = a.env.EmergencyConsecutiveInvalidThreshold
+	}
+	return stop, nil
+}
+
+func (a *App) saveEmergencyStop(stop *StatusEmergencyStop) error {
+	if stop == nil {
+		stop = &StatusEmergencyStop{}
+	}
+	if stop.Threshold == 0 {
+		stop.Threshold = a.env.EmergencyConsecutiveInvalidThreshold
+	}
+	return writeJSONAtomic(a.env.EmergencyStopPath(), stop)
+}
+
+func (a *App) buildEmergencyStop(lastEvent Event, consecutiveInvalid401 int) *StatusEmergencyStop {
+	threshold := a.env.EmergencyConsecutiveInvalidThreshold
+	return &StatusEmergencyStop{
+		Active:                true,
+		TriggeredAt:           lastEvent.At,
+		Reason:                fmt.Sprintf("consecutive maintpool invalid_401 results reached %d (threshold=%d); possible host/IP-level block. Stop further OpenAI interactions and inspect the current egress/IP before resuming.", consecutiveInvalid401, threshold),
+		ConsecutiveInvalid401: consecutiveInvalid401,
+		Threshold:             threshold,
+		TriggerEventType:      resultEmergencyStopTriggered,
+		LastResult:            lastEvent.Type,
+		LastHTTPStatus:        lastEvent.HTTPStatus,
+		LastAuthName:          lastEvent.Name,
+		LastEmail:             lastEvent.Email,
+		LastAccountID:         lastEvent.AccountID,
+		SuggestedAction:       "Review the host/IP-level 401 anomaly, confirm whether the latest invalid auths look correlated, then clear the stop with maintpoolctl clear-emergency-stop --reason <note> --apply after operator review.",
+	}
+}
+
 func (a *App) appendEvents(events []Event) error {
 	if len(events) == 0 {
 		return nil
@@ -1011,7 +1525,68 @@ func duplicateReasonBetween(left, right *coreauth.Auth) string {
 	return ""
 }
 
-func initializeImportedState(a *App, entry *FileState, authEntry *coreauth.Auth, now time.Time) {
+func normalizeImportOptions(options ImportOptions) (ImportOptions, error) {
+	options.CohortID = strings.TrimSpace(options.CohortID)
+	options.SourceBatchID = strings.TrimSpace(options.SourceBatchID)
+	options.Lane = strings.ToLower(strings.TrimSpace(options.Lane))
+	switch options.Lane {
+	case "", laneBaselinePending:
+		if options.Lane == laneBaselinePending {
+			if options.CohortID == "" {
+				return ImportOptions{}, fmt.Errorf("cohort id is required when import lane is baseline_pending")
+			}
+			if options.SourceBatchID == "" {
+				return ImportOptions{}, fmt.Errorf("source batch id is required when import lane is baseline_pending")
+			}
+		}
+		return options, nil
+	default:
+		return ImportOptions{}, fmt.Errorf("import lane %q is not supported; use baseline_pending or leave it empty", options.Lane)
+	}
+}
+
+func normalizeAssignLanesOptions(options AssignLanesOptions) (AssignLanesOptions, error) {
+	options.CohortID = strings.TrimSpace(options.CohortID)
+	if options.CohortID == "" {
+		return AssignLanesOptions{}, fmt.Errorf("cohort id is required")
+	}
+	for label, value := range map[string]int{
+		"guard_0": options.Guard0,
+		"guard_1": options.Guard1,
+		"guard_2": options.Guard2,
+	} {
+		if value < 0 {
+			return AssignLanesOptions{}, fmt.Errorf("%s must be >= 0", label)
+		}
+	}
+	return options, nil
+}
+
+func normalizeAdoptLegacyOptions(options AdoptLegacyOptions) (AdoptLegacyOptions, error) {
+	options.CohortID = strings.TrimSpace(options.CohortID)
+	options.SourceBatchID = strings.TrimSpace(options.SourceBatchID)
+	if options.CohortID == "" {
+		return AdoptLegacyOptions{}, fmt.Errorf("cohort id is required")
+	}
+	if options.SourceBatchID == "" {
+		return AdoptLegacyOptions{}, fmt.Errorf("source batch id is required")
+	}
+	for label, value := range map[string]int{
+		"guard_0": options.Guard0,
+		"guard_1": options.Guard1,
+		"guard_2": options.Guard2,
+	} {
+		if value < 0 {
+			return AdoptLegacyOptions{}, fmt.Errorf("%s must be >= 0", label)
+		}
+	}
+	if options.RequireLastRefreshWithin <= 0 {
+		return AdoptLegacyOptions{}, fmt.Errorf("require_last_refresh_within must be > 0")
+	}
+	return options, nil
+}
+
+func initializeImportedState(a *App, entry *FileState, authEntry *coreauth.Auth, now time.Time, options ImportOptions) {
 	if entry == nil {
 		return
 	}
@@ -1020,12 +1595,213 @@ func initializeImportedState(a *App, entry *FileState, authEntry *coreauth.Auth,
 	entry.LastProbeOKAt = time.Time{}
 	entry.LastRefreshAttemptAt = time.Time{}
 	entry.LastRefreshOKAt = time.Time{}
+	entry.BaselineRefreshOKAt = time.Time{}
 	entry.NextProbeAt = now.Add(a.nextInitialProbeDelay())
 	entry.NextRefreshDueAt = now.Add(a.nextInitialRefreshDelay())
+	entry.LaneAssignedAt = time.Time{}
 	entry.CooldownUntil = time.Time{}
 	entry.LastResult = resultImported
 	entry.LastHTTPStatus = 0
+	entry.CohortID = options.CohortID
+	entry.SourceBatchID = options.SourceBatchID
+	entry.Lane = options.Lane
+	entry.BaselineState = ""
+	if entry.Lane == laneBaselinePending {
+		entry.BaselineState = baselineStatePending
+	}
 	populateStateIdentity(entry, authEntry)
+}
+
+func canonicalStoredLane(entry *FileState) string {
+	if entry == nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(entry.Lane))
+}
+
+func effectiveDisplayLane(entry *FileState) string {
+	if lane := canonicalStoredLane(entry); lane != "" {
+		return lane
+	}
+	return laneLegacy
+}
+
+func isUnmanagedLegacyEntry(entry *FileState) bool {
+	if entry == nil {
+		return true
+	}
+	return canonicalStoredLane(entry) == "" &&
+		strings.TrimSpace(entry.CohortID) == "" &&
+		strings.TrimSpace(entry.SourceBatchID) == "" &&
+		strings.TrimSpace(entry.BaselineState) == ""
+}
+
+func effectiveBaselineState(entry *FileState) string {
+	if entry == nil {
+		return ""
+	}
+	if state := strings.ToLower(strings.TrimSpace(entry.BaselineState)); state != "" {
+		return state
+	}
+	switch canonicalStoredLane(entry) {
+	case laneBaselinePending:
+		return baselineStatePending
+	case laneMain, laneGuard0, laneGuard1, laneGuard2:
+		return baselineStateAdmitted
+	default:
+		return ""
+	}
+}
+
+func baselineLanePending(entry *FileState) bool {
+	return canonicalStoredLane(entry) == laneBaselinePending
+}
+
+func isSentinelLane(entry *FileState) bool {
+	switch canonicalStoredLane(entry) {
+	case laneGuard0, laneGuard1, laneGuard2:
+		return true
+	default:
+		return false
+	}
+}
+
+func entryAwaitingLaneAssignment(entry *FileState) bool {
+	return baselineLanePending(entry) && effectiveBaselineState(entry) == baselineStateReadyForAssignment
+}
+
+func baselineAssignmentAnchor(entry *FileState) time.Time {
+	if entry == nil {
+		return time.Time{}
+	}
+	if !entry.BaselineRefreshOKAt.IsZero() {
+		return entry.BaselineRefreshOKAt
+	}
+	return entry.LastRefreshOKAt
+}
+
+func promoteManagedGuardLane(entry *FileState, promotedAt time.Time) bool {
+	if !isSentinelLane(entry) {
+		return false
+	}
+	entry.Lane = laneMain
+	entry.LaneAssignedAt = promotedAt
+	return true
+}
+
+func (a *App) shouldConfirmAfterRefresh(entry *FileState, scheduled bool) bool {
+	if baselineLanePending(entry) || isSentinelLane(entry) {
+		return true
+	}
+	if canonicalStoredLane(entry) == laneMain {
+		return !scheduled
+	}
+	return true
+}
+
+func (a *App) managedLaneDueAt(lane string, anchor time.Time, authEntry *coreauth.Auth) time.Time {
+	if anchor.IsZero() {
+		return time.Time{}
+	}
+	switch strings.ToLower(strings.TrimSpace(lane)) {
+	case laneMain:
+		return anchor.Add(deterministicInitialDelay(authEntry, "managed-main-refresh", a.env.ManagedMainRefreshMinDelay(), a.env.ManagedMainRefreshMaxDelay()))
+	case laneGuard0, laneGuard1, laneGuard2:
+		minDelay, maxDelay, ok := a.env.ManagedGuardDelay(lane)
+		if !ok {
+			return time.Time{}
+		}
+		return anchor.Add(deterministicInitialDelay(authEntry, "managed-"+lane+"-refresh", minDelay, maxDelay))
+	default:
+		return time.Time{}
+	}
+}
+
+func effectiveRefreshBaseTime(entry *FileState) time.Time {
+	if entry == nil {
+		return time.Time{}
+	}
+	if !entry.LastRefreshOKAt.IsZero() {
+		return entry.LastRefreshOKAt
+	}
+	if !entry.BaselineRefreshOKAt.IsZero() {
+		return entry.BaselineRefreshOKAt
+	}
+	return entry.ImportedAt
+}
+
+func (a *App) effectiveRefreshHardMax(entry *FileState) time.Duration {
+	if a == nil || a.env == nil {
+		return 0
+	}
+	switch canonicalStoredLane(entry) {
+	case laneMain:
+		return a.env.ManagedMainRefreshHardMax()
+	case laneGuard0, laneGuard1, laneGuard2:
+		return a.env.ManagedGuardHardMax(canonicalStoredLane(entry))
+	default:
+		return a.env.RefreshHardMax
+	}
+}
+
+func (a *App) nextRefreshDueAfterConfirmedRefresh(entry *FileState, authEntry *coreauth.Auth, refreshTime time.Time) time.Time {
+	if canonicalStoredLane(entry) == laneMain {
+		if dueAt := a.managedLaneDueAt(laneMain, refreshTime, authEntry); !dueAt.IsZero() {
+			return dueAt
+		}
+	}
+	return refreshTime.Add(a.nextRefreshDelay())
+}
+
+func (a *App) nextRefreshDueAfterUnconfirmedRefresh(entry *FileState, authEntry *coreauth.Auth, refreshTime time.Time) time.Time {
+	switch canonicalStoredLane(entry) {
+	case laneBaselinePending, laneGuard0, laneGuard1, laneGuard2:
+		if !entry.CooldownUntil.IsZero() {
+			return entry.CooldownUntil
+		}
+	case laneMain:
+		if dueAt := a.managedLaneDueAt(laneMain, refreshTime, authEntry); !dueAt.IsZero() {
+			return dueAt
+		}
+	}
+	return refreshTime.Add(a.nextRefreshDelay())
+}
+
+func assignmentSortKey(cohortID string, authEntry *coreauth.Auth) string {
+	identity := strings.TrimSpace(cohortID) + "\x00" + baseName(authFileName(authEntry)) + "\x00" + refreshTokenHash(authEntry)
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
+}
+
+func appendAssignLaneSkip(result *AssignLanesResult, skip AssignLaneSkip) bool {
+	if len(result.Skipped) < cap(result.Skipped) {
+		result.Skipped = append(result.Skipped, skip)
+		return false
+	}
+	return true
+}
+
+func appendAdoptLegacySkip(result *AdoptLegacyResult, skip AssignLaneSkip) bool {
+	if len(result.Skipped) < cap(result.Skipped) {
+		result.Skipped = append(result.Skipped, skip)
+		return false
+	}
+	return true
+}
+
+func cloneEmergencyStop(stop *StatusEmergencyStop) *StatusEmergencyStop {
+	if stop == nil {
+		return nil
+	}
+	copyStop := *stop
+	return &copyStop
+}
+
+func authFileName(authEntry *coreauth.Auth) string {
+	if authEntry == nil {
+		return ""
+	}
+	return authEntry.FileName
 }
 
 func ensureStateEntry(state *StateFile, name string) *FileState {
@@ -1135,6 +1911,9 @@ func authObservedAt(authEntry *coreauth.Auth) time.Time {
 }
 
 func isProbeDue(entry *FileState, now time.Time) bool {
+	if entryAwaitingLaneAssignment(entry) {
+		return false
+	}
 	if entry == nil || entry.NextProbeAt.IsZero() {
 		return true
 	}
@@ -1142,20 +1921,23 @@ func isProbeDue(entry *FileState, now time.Time) bool {
 }
 
 func isRefreshDue(entry *FileState, now time.Time, hardMax time.Duration) bool {
+	if entryAwaitingLaneAssignment(entry) {
+		return false
+	}
 	if entry == nil {
 		return false
 	}
 	if !entry.NextRefreshDueAt.IsZero() && !entry.NextRefreshDueAt.After(now) {
 		return true
 	}
-	base := entry.LastRefreshOKAt
-	if base.IsZero() {
-		base = entry.ImportedAt
-	}
+	base := effectiveRefreshBaseTime(entry)
 	return !base.IsZero() && !base.Add(hardMax).After(now)
 }
 
 func effectiveDueAt(entry *FileState, now time.Time, hardMax time.Duration) time.Time {
+	if entryAwaitingLaneAssignment(entry) {
+		return time.Time{}
+	}
 	if entry == nil {
 		return now
 	}
@@ -1166,10 +1948,7 @@ func effectiveDueAt(entry *FileState, now time.Time, hardMax time.Duration) time
 	if !entry.NextRefreshDueAt.IsZero() {
 		candidates = append(candidates, entry.NextRefreshDueAt)
 	}
-	base := entry.LastRefreshOKAt
-	if base.IsZero() {
-		base = entry.ImportedAt
-	}
+	base := effectiveRefreshBaseTime(entry)
 	if !base.IsZero() {
 		candidates = append(candidates, base.Add(hardMax))
 	}
