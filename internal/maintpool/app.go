@@ -55,6 +55,7 @@ const (
 	resultRecoveryConfirm429     = "recovery_confirm_429"
 	resultRecoveryConfirmError   = "recovery_confirm_error"
 	resultEmergencyStopCleared   = "emergency_stop_cleared"
+	resultEmergencyStopAutoClear = "emergency_stop_auto_cleared"
 	resultEmergencyStopTriggered = "emergency_stop_triggered"
 
 	laneLegacy          = "legacy"
@@ -175,11 +176,12 @@ func (a *App) Status(ctx context.Context) (*StatusResult, error) {
 		},
 		Guardrails: StatusGuardrails{
 			EmergencyConsecutiveInvalidThreshold: a.env.EmergencyConsecutiveInvalidThreshold,
+			EmergencyStopMaxAge:                  a.env.EmergencyStopMaxAge,
 		},
 	}
 	result.Pool.ByLane = map[string]int{}
 	result.Pool.ByBaselineState = map[string]int{}
-	emergencyStop, err := a.loadEmergencyStop()
+	emergencyStop, err := a.loadEffectiveEmergencyStop(now)
 	if err != nil {
 		return nil, err
 	}
@@ -803,7 +805,7 @@ func (a *App) Scan(ctx context.Context, apply bool, limit int) (*ScanResult, err
 			return errList
 		}
 		pruneMissingStateEntries(state, auths)
-		emergencyStop, errEmergency := a.loadEmergencyStop()
+		emergencyStop, errEmergency := a.loadEffectiveEmergencyStop(a.now())
 		if errEmergency != nil {
 			return errEmergency
 		}
@@ -821,7 +823,14 @@ func (a *App) Scan(ctx context.Context, apply bool, limit int) (*ScanResult, err
 		if !apply {
 			return nil
 		}
-		if emergencyStop.Active {
+		emergencyStop, _, errEmergency = a.autoClearExpiredEmergencyStop()
+		if errEmergency != nil {
+			return errEmergency
+		}
+		if emergencyStop != nil && (emergencyStop.Active || emergencyStop.Threshold > 0) {
+			result.EmergencyStop = emergencyStop
+		}
+		if emergencyStop != nil && emergencyStop.Active {
 			result.Summary.EmergencyStopActive = true
 			return nil
 		}
@@ -1394,6 +1403,87 @@ func (a *App) loadEmergencyStop() (*StatusEmergencyStop, error) {
 		stop.Threshold = a.env.EmergencyConsecutiveInvalidThreshold
 	}
 	return stop, nil
+}
+
+func (a *App) loadEffectiveEmergencyStop(now time.Time) (*StatusEmergencyStop, error) {
+	stop, err := a.loadEmergencyStop()
+	if err != nil {
+		return nil, err
+	}
+	return a.effectiveEmergencyStop(stop, now), nil
+}
+
+func (a *App) effectiveEmergencyStop(stop *StatusEmergencyStop, now time.Time) *StatusEmergencyStop {
+	if stop == nil {
+		stop = &StatusEmergencyStop{}
+	}
+	effective := cloneEmergencyStop(stop)
+	if effective == nil {
+		effective = &StatusEmergencyStop{}
+	}
+	if effective.Threshold == 0 {
+		effective.Threshold = a.env.EmergencyConsecutiveInvalidThreshold
+	}
+	if a.env.EmergencyStopMaxAge <= 0 || effective.TriggeredAt.IsZero() {
+		return effective
+	}
+	effective.ExpiresAt = effective.TriggeredAt.Add(a.env.EmergencyStopMaxAge)
+	if effective.Active && !effective.ExpiresAt.After(now) {
+		effective.Active = false
+		effective.Expired = true
+	}
+	return effective
+}
+
+func (a *App) autoClearExpiredEmergencyStop() (*StatusEmergencyStop, bool, error) {
+	now := a.now()
+	previous, err := a.loadEmergencyStop()
+	if err != nil {
+		return nil, false, err
+	}
+	effective := a.effectiveEmergencyStop(previous, now)
+	if !previous.Active || effective.Active || !effective.Expired {
+		return effective, false, nil
+	}
+
+	current := &StatusEmergencyStop{
+		Active:    false,
+		Threshold: a.env.EmergencyConsecutiveInvalidThreshold,
+	}
+	if errSave := a.saveEmergencyStop(current); errSave != nil {
+		return nil, false, errSave
+	}
+
+	reason := fmt.Sprintf("emergency stop auto-resumed after %s without operator action", a.env.EmergencyStopMaxAge)
+	if errAppend := a.appendEvents([]Event{{
+		At:     now,
+		Type:   resultEmergencyStopAutoClear,
+		Reason: reason,
+	}}); errAppend != nil {
+		if rollbackErr := a.saveEmergencyStop(previous); rollbackErr != nil {
+			return nil, false, fmt.Errorf("append auto-clear-emergency-stop event: %w; rollback failed: %v", errAppend, rollbackErr)
+		}
+		return nil, false, fmt.Errorf("append auto-clear-emergency-stop event: %w", errAppend)
+	}
+
+	view := cloneEmergencyStop(current)
+	if view == nil {
+		view = &StatusEmergencyStop{}
+	}
+	view.TriggeredAt = previous.TriggeredAt
+	view.ExpiresAt = effective.ExpiresAt
+	view.Expired = true
+	view.Reason = reason
+	view.ConsecutiveInvalid401 = previous.ConsecutiveInvalid401
+	view.Threshold = current.Threshold
+	view.TriggerEventType = resultEmergencyStopAutoClear
+	view.LastResult = previous.LastResult
+	view.LastHTTPStatus = previous.LastHTTPStatus
+	view.LastAuthName = previous.LastAuthName
+	view.LastEmail = previous.LastEmail
+	view.LastAccountID = previous.LastAccountID
+	view.SuggestedAction = "Review the prior host/IP-level 401 burst before trusting resumed maintpool refresh on this host."
+	return view, true, nil
 }
 
 func (a *App) saveEmergencyStop(stop *StatusEmergencyStop) error {

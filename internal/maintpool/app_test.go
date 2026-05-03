@@ -1519,6 +1519,122 @@ func TestScanApplySkipsProcessingWhenEmergencyStopIsActive(t *testing.T) {
 	}
 }
 
+func TestScanApplyAutoClearsExpiredEmergencyStopAndResumesProcessing(t *testing.T) {
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	app, env := newTestApp(t, now)
+
+	writeAuthFixture(t, filepath.Join(env.PoolDir(), "a.json"), map[string]any{
+		"type":          "codex",
+		"refresh_token": "refresh-a",
+	})
+	state := &StateFile{
+		Files: map[string]*FileState{
+			"a.json": {ImportedAt: now.Add(-72 * time.Hour), NextRefreshDueAt: now.Add(-time.Hour)},
+		},
+	}
+	if err := app.saveState(state); err != nil {
+		t.Fatalf("saveState() error = %v", err)
+	}
+	if err := app.saveEmergencyStop(&StatusEmergencyStop{
+		Active:                true,
+		TriggeredAt:           now.Add(-49 * time.Hour),
+		Reason:                "test stop",
+		ConsecutiveInvalid401: 3,
+		Threshold:             3,
+	}); err != nil {
+		t.Fatalf("saveEmergencyStop() error = %v", err)
+	}
+
+	refreshCalls := 0
+	app.refreshAuthFunc = func(_ context.Context, authEntry *coreauth.Auth) (*coreauth.Auth, error) {
+		refreshCalls++
+		cloned := authEntry.Clone()
+		if cloned == nil {
+			t.Fatal("refresh auth clone is nil")
+		}
+		if cloned.Metadata == nil {
+			cloned.Metadata = map[string]any{}
+		}
+		cloned.Metadata["access_token"] = "new-access"
+		cloned.Metadata["account_id"] = "acct-a"
+		return cloned, nil
+	}
+	app.usageProbeFunc = func(_ context.Context, _ *coreauth.Auth) (*usageProbeResponse, error) {
+		return &usageProbeResponse{StatusCode: 200, Body: `{"plan_type":"free"}`}, nil
+	}
+
+	result, err := app.Scan(context.Background(), true, 1)
+	if err != nil {
+		t.Fatalf("Scan(apply) error = %v", err)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refreshCalls = %d, want 1 after auto-clear", refreshCalls)
+	}
+	if result.Summary.Processed != 1 {
+		t.Fatalf("result.Summary.Processed = %d, want 1", result.Summary.Processed)
+	}
+	if result.Summary.EmergencyStopActive {
+		t.Fatal("result.Summary.EmergencyStopActive = true, want false after auto-clear")
+	}
+	if result.EmergencyStop == nil {
+		t.Fatal("result.EmergencyStop = nil, want auto-cleared stop view")
+	}
+	if result.EmergencyStop.Active {
+		t.Fatalf("result.EmergencyStop.Active = true, want false: %#v", result.EmergencyStop)
+	}
+	if !result.EmergencyStop.Expired {
+		t.Fatalf("result.EmergencyStop.Expired = false, want true: %#v", result.EmergencyStop)
+	}
+	if result.EmergencyStop.TriggerEventType != resultEmergencyStopAutoClear {
+		t.Fatalf("result.EmergencyStop.TriggerEventType = %q, want %q", result.EmergencyStop.TriggerEventType, resultEmergencyStopAutoClear)
+	}
+
+	stop, err := app.loadEmergencyStop()
+	if err != nil {
+		t.Fatalf("loadEmergencyStop() error = %v", err)
+	}
+	if stop.Active {
+		t.Fatalf("persisted stop.Active = true, want false: %#v", stop)
+	}
+
+	raw, err := os.ReadFile(env.EventsPath())
+	if err != nil {
+		t.Fatalf("ReadFile(events) error = %v", err)
+	}
+	if !strings.Contains(string(raw), resultEmergencyStopAutoClear) {
+		t.Fatalf("events = %q, want %q entry", string(raw), resultEmergencyStopAutoClear)
+	}
+}
+
+func TestStatusTreatsExpiredEmergencyStopAsInactive(t *testing.T) {
+	now := time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)
+	app, _ := newTestApp(t, now)
+
+	if err := app.saveEmergencyStop(&StatusEmergencyStop{
+		Active:                true,
+		TriggeredAt:           now.Add(-49 * time.Hour),
+		Reason:                "test stop",
+		ConsecutiveInvalid401: 3,
+		Threshold:             3,
+	}); err != nil {
+		t.Fatalf("saveEmergencyStop() error = %v", err)
+	}
+
+	status, err := app.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if status.EmergencyStop.Active {
+		t.Fatalf("status.EmergencyStop.Active = true, want false: %#v", status.EmergencyStop)
+	}
+	if !status.EmergencyStop.Expired {
+		t.Fatalf("status.EmergencyStop.Expired = false, want true: %#v", status.EmergencyStop)
+	}
+	if status.Guardrails.EmergencyStopMaxAge != 48*time.Hour {
+		t.Fatalf("status.Guardrails.EmergencyStopMaxAge = %s, want 48h", status.Guardrails.EmergencyStopMaxAge)
+	}
+}
+
 func TestClearEmergencyStopApplyPersistsInactiveStopAndEvent(t *testing.T) {
 	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
 	app, env := newTestApp(t, now)
@@ -1595,6 +1711,7 @@ func newTestApp(t *testing.T, now time.Time) (*App, *EnvConfig) {
 		ManagedGuard1Offset:                  24 * time.Hour,
 		ManagedGuard2Offset:                  48 * time.Hour,
 		ManagedGuardJitterMax:                6 * time.Hour,
+		EmergencyStopMaxAge:                  48 * time.Hour,
 		EmergencyConsecutiveInvalidThreshold: 3,
 	}
 	if err := env.EnsureDirectories(); err != nil {

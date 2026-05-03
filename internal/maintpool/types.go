@@ -96,12 +96,15 @@ type StatusCadence struct {
 }
 
 type StatusGuardrails struct {
-	EmergencyConsecutiveInvalidThreshold int `json:"emergency_consecutive_invalid_threshold"`
+	EmergencyConsecutiveInvalidThreshold int           `json:"emergency_consecutive_invalid_threshold"`
+	EmergencyStopMaxAge                  time.Duration `json:"emergency_stop_max_age"`
 }
 
 type StatusEmergencyStop struct {
 	Active                bool      `json:"active"`
 	TriggeredAt           time.Time `json:"triggered_at,omitempty"`
+	ExpiresAt             time.Time `json:"expires_at,omitempty"`
+	Expired               bool      `json:"expired,omitempty"`
 	Reason                string    `json:"reason,omitempty"`
 	ConsecutiveInvalid401 int       `json:"consecutive_invalid_401,omitempty"`
 	Threshold             int       `json:"threshold,omitempty"`

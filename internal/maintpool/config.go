@@ -45,6 +45,7 @@ type EnvConfig struct {
 	ManagedGuard1Offset                  time.Duration
 	ManagedGuard2Offset                  time.Duration
 	ManagedGuardJitterMax                time.Duration
+	EmergencyStopMaxAge                  time.Duration
 	EmergencyConsecutiveInvalidThreshold int
 }
 
@@ -81,6 +82,7 @@ func LoadEnvConfig(envPath string) (*EnvConfig, error) {
 		ManagedGuard1Offset:                  parseEnvDuration(values, "MANAGED_GUARD_1_OFFSET", 24*time.Hour),
 		ManagedGuard2Offset:                  parseEnvDuration(values, "MANAGED_GUARD_2_OFFSET", 48*time.Hour),
 		ManagedGuardJitterMax:                parseEnvDuration(values, "MANAGED_GUARD_JITTER_MAX", 6*time.Hour),
+		EmergencyStopMaxAge:                  parseEnvDuration(values, "EMERGENCY_STOP_MAX_AGE", 48*time.Hour),
 		EmergencyConsecutiveInvalidThreshold: parseEnvInt(values, "EMERGENCY_CONSECUTIVE_INVALID_THRESHOLD", 3),
 	}
 	if cfg.Timezone == "" {
@@ -157,6 +159,9 @@ func (c *EnvConfig) Validate() error {
 	}
 	if c.ManagedGuardJitterMax < 0 {
 		return fmt.Errorf("MANAGED_GUARD_JITTER_MAX must be >= 0")
+	}
+	if c.EmergencyStopMaxAge < 0 {
+		return fmt.Errorf("EMERGENCY_STOP_MAX_AGE must be >= 0")
 	}
 	if c.EmergencyConsecutiveInvalidThreshold < 0 {
 		return fmt.Errorf("EMERGENCY_CONSECUTIVE_INVALID_THRESHOLD must be >= 0")
