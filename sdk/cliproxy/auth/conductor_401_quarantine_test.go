@@ -471,6 +471,134 @@ func TestManager_refreshAuth_TokenInvalidatedProbeFailureReschedulesWithoutReflo
 	}
 }
 
+func TestManager_refreshAuth_RefreshTokenReusedMovesAuthToWarehouse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := &quarantineWarehouseStore{root: t.TempDir()}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(quarantineTestExecutor{
+		provider: "codex",
+		refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
+			return nil, &Error{
+				HTTPStatus: http.StatusUnauthorized,
+				Message:    `{"error":{"message":"Your refresh token has already been used to generate a new access token. Please try signing in again.","code":"refresh_token_reused"},"status":401}`,
+			}
+		},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-token-reused.json",
+		FileName: "refresh-token-reused.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":          "codex",
+			"email":         "refresh-token-reused@example.com",
+			"refresh_token": "stale-refresh-token",
+		},
+		LastError: &Error{
+			Code:       auth401KindTokenInvalidated,
+			Message:    auth401KindTokenInvalidated,
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		Unavailable:      true,
+		NextRetryAfter:   time.Now().Add(24 * time.Hour),
+		NextRefreshAfter: time.Now().Add(24 * time.Hour),
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	sourcePath, err := quarantineStorePath(store.root, auth)
+	if err != nil {
+		t.Fatalf("quarantineStorePath: %v", err)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	if updated, ok := manager.GetByID(auth.ID); ok || updated != nil {
+		t.Fatalf("expected auth %q removed from manager after refresh-token-reused archive", auth.ID)
+	}
+	if _, err = os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("expected source auth removed, stat err = %v", err)
+	}
+	archivedPath := findArchivedWarehouseFile(t, store.root, "refresh-token-reused.json")
+	if _, err = os.Stat(archivedPath); err != nil {
+		t.Fatalf("expected archived refresh-token-reused auth file: %v", err)
+	}
+}
+
+func TestManager_refreshAuth_TerminalRefreshTokenCodeMovesAuthToWarehouse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		code string
+	}{
+		{name: "reused", code: "refresh_token_reused"},
+		{name: "invalidated", code: "refresh_token_invalidated"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			store := &quarantineWarehouseStore{root: t.TempDir()}
+			manager := NewManager(store, &RoundRobinSelector{}, nil)
+			manager.RegisterExecutor(quarantineTestExecutor{
+				provider: "codex",
+				refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
+					return nil, &Error{
+						Code:       tt.code,
+						HTTPStatus: http.StatusUnauthorized,
+						Message:    "terminal refresh token failure",
+					}
+				},
+			})
+
+			auth := &Auth{
+				ID:       tt.name + "-terminal-refresh-token.json",
+				FileName: tt.name + "-terminal-refresh-token.json",
+				Provider: "codex",
+				Metadata: map[string]any{
+					"type":          "codex",
+					"email":         tt.name + "-terminal-refresh-token@example.com",
+					"refresh_token": "stale-refresh-token",
+				},
+				LastError: &Error{
+					Code:       auth401KindTokenInvalidated,
+					Message:    auth401KindTokenInvalidated,
+					HTTPStatus: http.StatusUnauthorized,
+				},
+				Unavailable:      true,
+				NextRetryAfter:   time.Now().Add(24 * time.Hour),
+				NextRefreshAfter: time.Now().Add(24 * time.Hour),
+			}
+			if _, err := manager.Register(ctx, auth); err != nil {
+				t.Fatalf("register auth: %v", err)
+			}
+			sourcePath, err := quarantineStorePath(store.root, auth)
+			if err != nil {
+				t.Fatalf("quarantineStorePath: %v", err)
+			}
+
+			manager.refreshAuth(ctx, auth.ID)
+
+			if updated, ok := manager.GetByID(auth.ID); ok || updated != nil {
+				t.Fatalf("expected auth %q removed from manager after terminal refresh-token archive", auth.ID)
+			}
+			if _, err = os.Stat(sourcePath); !os.IsNotExist(err) {
+				t.Fatalf("expected source auth removed, stat err = %v", err)
+			}
+			archivedPath := findArchivedWarehouseFile(t, store.root, auth.FileName)
+			if _, err = os.Stat(archivedPath); err != nil {
+				t.Fatalf("expected archived terminal refresh-token auth file: %v", err)
+			}
+		})
+	}
+}
+
 func TestManager_refreshAuth_AccountDeactivatedMovesAuthToWarehouse(t *testing.T) {
 	t.Parallel()
 

@@ -46,6 +46,8 @@ func (m *Manager) shouldArchiveExternal401Auth(auth *Auth) bool {
 	switch authWide401Quarantine(auth) {
 	case auth401KindAccountDeactivated, auth401KindTokenExpired:
 		return true
+	case auth401KindTokenInvalidated:
+		return isTerminalRefreshToken401(auth.LastError)
 	default:
 		return false
 	}

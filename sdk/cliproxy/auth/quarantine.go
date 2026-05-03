@@ -38,6 +38,9 @@ func auth401QuarantineKindText(raw string) string {
 	switch {
 	case lower == auth401KindTokenInvalidated || strings.Contains(lower, auth401KindTokenInvalidated):
 		return auth401KindTokenInvalidated
+	case strings.Contains(lower, "refresh_token_reused"),
+		strings.Contains(lower, "refresh_token_invalidated"):
+		return auth401KindTokenInvalidated
 	case lower == auth401KindAccountDeactivated || strings.Contains(lower, auth401KindAccountDeactivated):
 		return auth401KindAccountDeactivated
 	default:
@@ -83,6 +86,9 @@ func normalize401Error(err *Error) *Error {
 		return nil
 	}
 	cloned := cloneError(err)
+	if isTerminalRefreshToken401(cloned) {
+		return cloned
+	}
 	if kind := auth401QuarantineKind(cloned); kind != auth401KindNone {
 		cloned.Code = kind
 	}
@@ -94,6 +100,9 @@ func normalize401ErrorForAuth(auth *Auth, err *Error, now time.Time) *Error {
 		return nil
 	}
 	cloned := cloneError(err)
+	if isTerminalRefreshToken401(cloned) {
+		return cloned
+	}
 	if kind := auth401QuarantineKindForAuth(auth, cloned, now); kind != auth401KindNone {
 		cloned.Code = kind
 	}
@@ -204,6 +213,19 @@ func isHardExpiredCodexAuthWithoutRefresh(auth *Auth, now time.Time) bool {
 
 func authHasRefreshToken(auth *Auth) bool {
 	return auth != nil && auth.RefreshToken() != ""
+}
+
+func isTerminalRefreshToken401(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	return terminalRefreshToken401Text(err.Code) || terminalRefreshToken401Text(err.Message)
+}
+
+func terminalRefreshToken401Text(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	return strings.Contains(lower, "refresh_token_reused") ||
+		strings.Contains(lower, "refresh_token_invalidated")
 }
 
 func stringValueFromMetadata(meta map[string]any, keys ...string) string {
