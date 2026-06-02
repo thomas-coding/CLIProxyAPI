@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 type quarantineTestExecutor struct {
 	provider   string
 	refreshFn  func(context.Context, *Auth) (*Auth, error)
+	httpFn     func(context.Context, *Auth, *http.Request) (*http.Response, error)
 	executeErr error
 }
 
@@ -44,6 +46,9 @@ func (e quarantineTestExecutor) CountTokens(ctx context.Context, auth *Auth, req
 }
 
 func (e quarantineTestExecutor) HttpRequest(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+	if e.httpFn != nil {
+		return e.httpFn(ctx, auth, req)
+	}
 	return nil, nil
 }
 
@@ -155,17 +160,29 @@ func (s *blockingArchiveStore) PersistAuthFiles(context.Context, string, ...stri
 	return s.failPersist
 }
 
-func TestManager_MarkResult_TokenInvalidatedQuarantinesAuthWide(t *testing.T) {
+func TestManager_MarkResult_TokenInvalidatedMovesAuthToWarehouse(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	manager := NewManager(nil, &RoundRobinSelector{}, nil)
-	auth := &Auth{ID: "token-invalidated", Provider: "codex"}
+	store := &quarantineWarehouseStore{root: t.TempDir()}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "token-invalidated.json",
+		FileName: "token-invalidated.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "token-invalidated@example.com",
+		},
+	}
 	if _, err := manager.Register(ctx, auth); err != nil {
 		t.Fatalf("register auth: %v", err)
 	}
+	sourcePath, err := quarantineStorePath(store.root, auth)
+	if err != nil {
+		t.Fatalf("quarantineStorePath: %v", err)
+	}
 
-	start := time.Now()
 	manager.MarkResult(ctx, Result{
 		AuthID:   auth.ID,
 		Provider: auth.Provider,
@@ -177,12 +194,106 @@ func TestManager_MarkResult_TokenInvalidatedQuarantinesAuthWide(t *testing.T) {
 		},
 	})
 
+	if updated, ok := manager.GetByID(auth.ID); ok || updated != nil {
+		t.Fatalf("expected auth %q removed from manager after archive", auth.ID)
+	}
+	if _, err = os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("expected source auth removed, stat err = %v", err)
+	}
+	archivedPath := findArchivedWarehouseFile(t, store.root, "token-invalidated.json")
+	if _, err = os.Stat(archivedPath); err != nil {
+		t.Fatalf("expected archived auth file: %v", err)
+	}
+}
+
+func TestManager_MarkResult_TokenRevokedMovesAuthToWarehouse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := &quarantineWarehouseStore{root: t.TempDir()}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "token-revoked.json",
+		FileName: "token-revoked.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":  "codex",
+			"email": "token-revoked@example.com",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	sourcePath, err := quarantineStorePath(store.root, auth)
+	if err != nil {
+		t.Fatalf("quarantineStorePath: %v", err)
+	}
+
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"token_revoked"},"status":401}`,
+		},
+	})
+
+	if updated, ok := manager.GetByID(auth.ID); ok || updated != nil {
+		t.Fatalf("expected auth %q removed from manager after archive", auth.ID)
+	}
+	if _, err = os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("expected source auth removed, stat err = %v", err)
+	}
+	archivedPath := findArchivedWarehouseFile(t, store.root, "token-revoked.json")
+	if _, err = os.Stat(archivedPath); err != nil {
+		t.Fatalf("expected archived auth file: %v", err)
+	}
+}
+
+func TestManager_MarkResult_Unknown401QuarantinesUntilUsageProbe(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := &quarantineWarehouseStore{root: t.TempDir()}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	auth := &Auth{
+		ID:       "unknown-401.json",
+		FileName: "unknown-401.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":       "codex",
+			"email":      "unknown-401@example.com",
+			"account_id": "acct-unknown",
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	sourcePath, err := quarantineStorePath(store.root, auth)
+	if err != nil {
+		t.Fatalf("quarantineStorePath: %v", err)
+	}
+
+	start := time.Now()
+	manager.MarkResult(ctx, Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusUnauthorized,
+			Message:    `{"error":{"message":"unexpected unauthorized"},"status":401}`,
+		},
+	})
+
 	updated, ok := manager.GetByID(auth.ID)
 	if !ok || updated == nil {
-		t.Fatalf("GetByID(%q) returned no auth", auth.ID)
+		t.Fatalf("expected auth %q to remain managed", auth.ID)
 	}
-	if authWide401Quarantine(updated) != auth401KindTokenInvalidated {
-		t.Fatalf("quarantine kind = %q, want %q", authWide401Quarantine(updated), auth401KindTokenInvalidated)
+	if got := authWide401Quarantine(updated); got != auth401KindUnknown {
+		t.Fatalf("quarantine kind = %q, want %q", got, auth401KindUnknown)
 	}
 	if !updated.Unavailable {
 		t.Fatalf("expected auth to be unavailable")
@@ -190,7 +301,10 @@ func TestManager_MarkResult_TokenInvalidatedQuarantinesAuthWide(t *testing.T) {
 	assertCooldownWithin(t, updated.NextRetryAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
 	assertCooldownWithin(t, updated.NextRefreshAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
 	if len(updated.ModelStates) != 0 {
-		t.Fatalf("expected auth-wide quarantine without model cooldown state, got %#v", updated.ModelStates)
+		t.Fatalf("expected auth-wide quarantine without model state, got %#v", updated.ModelStates)
+	}
+	if _, err = os.Stat(sourcePath); err != nil {
+		t.Fatalf("expected source auth to remain in production pool: %v", err)
 	}
 }
 
@@ -370,29 +484,48 @@ func TestManager_MarkResult_TokenExpiredWithRefreshTokenStaysModelScoped(t *test
 	}
 }
 
-func TestManager_refreshAuth_TokenInvalidatedProbeSuccessClearsQuarantine(t *testing.T) {
+func TestManager_refreshAuth_Unknown401UsageProbeSuccessClearsQuarantine(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	steps := make([]string, 0, 2)
 	manager.RegisterExecutor(quarantineTestExecutor{
 		provider: "codex",
 		refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
+			steps = append(steps, "refresh")
 			cloned := auth.Clone()
-			if cloned.Metadata == nil {
-				cloned.Metadata = make(map[string]any)
-			}
-			cloned.Metadata["refreshed"] = true
+			cloned.Metadata["access_token"] = "fresh-token"
 			return cloned, nil
+		},
+		httpFn: func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+			steps = append(steps, "usage")
+			if got := stringValueFromMetadata(auth.Metadata, "access_token"); got != "fresh-token" {
+				t.Fatalf("usage probe access_token = %q, want fresh-token", got)
+			}
+			if req.URL.String() != codexUsageProbeURL {
+				t.Fatalf("probe URL = %q, want %q", req.URL.String(), codexUsageProbeURL)
+			}
+			if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-unknown" {
+				t.Fatalf("Chatgpt-Account-Id = %q, want acct-unknown", got)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"allowed":true}`)),
+				Header:     make(http.Header),
+			}, nil
 		},
 	})
 
 	auth := &Auth{
 		ID:       "probe-success",
 		Provider: "codex",
+		Metadata: map[string]any{
+			"account_id": "acct-unknown",
+		},
 		LastError: &Error{
-			Code:       auth401KindTokenInvalidated,
-			Message:    "token invalidated",
+			Code:       auth401KindUnknown,
+			Message:    "unknown 401",
 			HTTPStatus: http.StatusUnauthorized,
 		},
 		Unavailable:      true,
@@ -404,6 +537,9 @@ func TestManager_refreshAuth_TokenInvalidatedProbeSuccessClearsQuarantine(t *tes
 	}
 
 	manager.refreshAuth(ctx, auth.ID)
+	if got := strings.Join(steps, ","); got != "refresh,usage" {
+		t.Fatalf("steps = %q, want refresh,usage", got)
+	}
 
 	updated, ok := manager.GetByID(auth.ID)
 	if !ok || updated == nil {
@@ -421,9 +557,15 @@ func TestManager_refreshAuth_TokenInvalidatedProbeSuccessClearsQuarantine(t *tes
 	if !updated.NextRetryAfter.IsZero() {
 		t.Fatalf("next retry after = %v, want zero", updated.NextRetryAfter)
 	}
+	if got := stringValueFromMetadata(updated.Metadata, "access_token"); got != "fresh-token" {
+		t.Fatalf("persisted access_token = %q, want fresh-token", got)
+	}
+	if updated.LastRefreshedAt.IsZero() {
+		t.Fatalf("expected last refreshed timestamp after refresh-before-probe")
+	}
 }
 
-func TestManager_refreshAuth_TokenInvalidatedProbeFailureReschedulesWithoutReflow(t *testing.T) {
+func TestManager_refreshAuth_Unknown401UsageProbeDeniedKeepsQuarantine(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -431,16 +573,31 @@ func TestManager_refreshAuth_TokenInvalidatedProbeFailureReschedulesWithoutReflo
 	manager.RegisterExecutor(quarantineTestExecutor{
 		provider: "codex",
 		refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
-			return nil, fmt.Errorf("dial tcp timeout")
+			cloned := auth.Clone()
+			cloned.Metadata["access_token"] = "fresh-denied-token"
+			return cloned, nil
+		},
+		httpFn: func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+			if got := stringValueFromMetadata(auth.Metadata, "access_token"); got != "fresh-denied-token" {
+				t.Fatalf("usage probe access_token = %q, want fresh-denied-token", got)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"allowed":false,"limit_reached":true}`)),
+				Header:     make(http.Header),
+			}, nil
 		},
 	})
 
 	auth := &Auth{
-		ID:       "probe-failure",
+		ID:       "probe-denied",
 		Provider: "codex",
+		Metadata: map[string]any{
+			"account_id": "acct-unknown",
+		},
 		LastError: &Error{
-			Code:       auth401KindTokenInvalidated,
-			Message:    "token invalidated",
+			Code:       auth401KindUnknown,
+			Message:    "unknown 401",
 			HTTPStatus: http.StatusUnauthorized,
 		},
 		Unavailable:      true,
@@ -458,8 +615,115 @@ func TestManager_refreshAuth_TokenInvalidatedProbeFailureReschedulesWithoutReflo
 	if !ok || updated == nil {
 		t.Fatalf("GetByID(%q) returned no auth", auth.ID)
 	}
-	if authWide401Quarantine(updated) != auth401KindTokenInvalidated {
-		t.Fatalf("quarantine kind = %q, want %q", authWide401Quarantine(updated), auth401KindTokenInvalidated)
+	if got := authWide401Quarantine(updated); got != auth401KindUnknown {
+		t.Fatalf("quarantine kind = %q, want %q", got, auth401KindUnknown)
+	}
+	if !updated.Unavailable {
+		t.Fatalf("expected auth to remain unavailable after denied probe")
+	}
+	if got := stringValueFromMetadata(updated.Metadata, "access_token"); got != "fresh-denied-token" {
+		t.Fatalf("persisted access_token = %q, want fresh-denied-token", got)
+	}
+	assertCooldownWithin(t, updated.NextRefreshAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
+	assertCooldownWithin(t, updated.NextRetryAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
+}
+
+func TestManager_refreshAuth_Unknown401RefreshFailureSkipsUsageProbe(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(quarantineTestExecutor{
+		provider: "codex",
+		refreshFn: func(ctx context.Context, auth *Auth) (*Auth, error) {
+			return nil, fmt.Errorf("dial tcp timeout")
+		},
+		httpFn: func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+			t.Fatalf("usage probe should not run when refresh fails")
+			return nil, nil
+		},
+	})
+
+	auth := &Auth{
+		ID:       "refresh-failure-before-probe",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"account_id": "acct-unknown",
+		},
+		LastError: &Error{
+			Code:       auth401KindUnknown,
+			Message:    "unknown 401",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		Unavailable:      true,
+		NextRetryAfter:   time.Now().Add(24 * time.Hour),
+		NextRefreshAfter: time.Now().Add(24 * time.Hour),
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	start := time.Now()
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("GetByID(%q) returned no auth", auth.ID)
+	}
+	if got := authWide401Quarantine(updated); got != auth401KindUnknown {
+		t.Fatalf("quarantine kind = %q, want %q", got, auth401KindUnknown)
+	}
+	assertCooldownWithin(t, updated.NextRefreshAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
+	assertCooldownWithin(t, updated.NextRetryAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
+	if updated.LastError == nil || !strings.Contains(updated.LastError.Message, "refresh failed") {
+		t.Fatalf("last error = %#v, want refresh failed message", updated.LastError)
+	}
+}
+
+func TestManager_refreshAuth_Unknown401UsageProbeFailureReschedulesWithoutReflow(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(quarantineTestExecutor{
+		provider: "codex",
+		httpFn: func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"unexpected unauthorized"},"status":401}`)),
+				Header:     make(http.Header),
+			}, nil
+		},
+	})
+
+	auth := &Auth{
+		ID:       "probe-failure",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"account_id": "acct-unknown",
+		},
+		LastError: &Error{
+			Code:       auth401KindUnknown,
+			Message:    "unknown 401",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		Unavailable:      true,
+		NextRetryAfter:   time.Now().Add(24 * time.Hour),
+		NextRefreshAfter: time.Now().Add(24 * time.Hour),
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	start := time.Now()
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("GetByID(%q) returned no auth", auth.ID)
+	}
+	if authWide401Quarantine(updated) != auth401KindUnknown {
+		t.Fatalf("quarantine kind = %q, want %q", authWide401Quarantine(updated), auth401KindUnknown)
 	}
 	if !updated.Unavailable {
 		t.Fatalf("expected auth to remain unavailable after failed probe")
@@ -468,6 +732,63 @@ func TestManager_refreshAuth_TokenInvalidatedProbeFailureReschedulesWithoutReflo
 	assertCooldownWithin(t, updated.NextRetryAfter, start, 23*time.Hour+59*time.Minute, 24*time.Hour+1*time.Minute)
 	if updated.LastError == nil || updated.LastError.Message == "" {
 		t.Fatalf("expected last error to record the failed probe")
+	}
+}
+
+func TestManager_refreshAuth_Unknown401UsageProbeTokenRevokedMovesAuthToWarehouse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := &quarantineWarehouseStore{root: t.TempDir()}
+	manager := NewManager(store, &RoundRobinSelector{}, nil)
+	manager.RegisterExecutor(quarantineTestExecutor{
+		provider: "codex",
+		httpFn: func(ctx context.Context, auth *Auth, req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Encountered invalidated oauth token for user, failing request","code":"token_revoked"},"status":401}`)),
+				Header:     make(http.Header),
+			}, nil
+		},
+	})
+
+	auth := &Auth{
+		ID:       "unknown-probe-token-revoked.json",
+		FileName: "unknown-probe-token-revoked.json",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"type":       "codex",
+			"email":      "unknown-probe-token-revoked@example.com",
+			"account_id": "acct-unknown",
+		},
+		LastError: &Error{
+			Code:       auth401KindUnknown,
+			Message:    "unknown 401",
+			HTTPStatus: http.StatusUnauthorized,
+		},
+		Unavailable:      true,
+		NextRetryAfter:   time.Now().Add(24 * time.Hour),
+		NextRefreshAfter: time.Now().Add(24 * time.Hour),
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+	sourcePath, err := quarantineStorePath(store.root, auth)
+	if err != nil {
+		t.Fatalf("quarantineStorePath: %v", err)
+	}
+
+	manager.refreshAuth(ctx, auth.ID)
+
+	if updated, ok := manager.GetByID(auth.ID); ok || updated != nil {
+		t.Fatalf("expected auth %q removed from manager after usage probe archive", auth.ID)
+	}
+	if _, err = os.Stat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("expected source auth removed, stat err = %v", err)
+	}
+	archivedPath := findArchivedWarehouseFile(t, store.root, "unknown-probe-token-revoked.json")
+	if _, err = os.Stat(archivedPath); err != nil {
+		t.Fatalf("expected archived auth file: %v", err)
 	}
 }
 

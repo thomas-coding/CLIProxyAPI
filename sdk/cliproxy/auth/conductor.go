@@ -82,6 +82,9 @@ const (
 	codexColdKeepaliveCoverageDivisor = 28
 	codexHardRefreshWaitTimeout       = 2 * time.Second
 	codexHardRefreshPollInterval      = 100 * time.Millisecond
+	codexUsageProbeURL                = "https://chatgpt.com/backend-api/wham/usage"
+	codexUsageProbeUserAgent          = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	codexUsageProbeBodyLimit          = 64 * 1024
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -3233,7 +3236,7 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		return false
 	}
 	if kind := authWide401Quarantine(a); kind != auth401KindNone {
-		return kind == auth401KindTokenInvalidated
+		return kind == auth401KindTokenInvalidated || kind == auth401KindTokenRevoked || kind == auth401KindUnknown
 	}
 	if isCodexProvider(a.Provider) {
 		return false
@@ -3512,6 +3515,14 @@ func (m *Manager) refreshAuthSync(ctx context.Context, id string) (*Auth, error)
 		return nil, nil
 	}
 	cloned := auth.Clone()
+	switch authWide401Quarantine(cloned) {
+	case auth401KindUnknown:
+		return m.probeUnknown401AuthSync(ctx, cloned, exec)
+	case auth401KindTokenInvalidated, auth401KindTokenRevoked:
+		err := &Error{Code: authWide401Quarantine(cloned), Message: authWide401Quarantine(cloned), HTTPStatus: http.StatusUnauthorized}
+		m.applyRefreshFailure(ctx, id, err, time.Now())
+		return nil, err
+	}
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
@@ -3542,6 +3553,177 @@ func (m *Manager) refreshAuthSync(ctx context.Context, id string) (*Auth, error)
 		return updated.Clone(), nil
 	}
 	return saved, nil
+}
+
+func (m *Manager) probeUnknown401AuthSync(ctx context.Context, auth *Auth, exec ProviderExecutor) (*Auth, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if auth == nil || exec == nil {
+		return nil, nil
+	}
+	refreshed, errRefresh := exec.Refresh(ctx, auth.Clone())
+	now := time.Now()
+	if errRefresh != nil {
+		if errors.Is(errRefresh, context.Canceled) {
+			log.Debugf("unknown 401 refresh canceled for %s, %s", auth.Provider, auth.ID)
+			return nil, errRefresh
+		}
+		if shouldApplyTerminal401RefreshFailure(errRefresh) {
+			m.applyRefreshFailure(ctx, auth.ID, errRefresh, now)
+		} else {
+			m.applyUnknown401ProbeFailure(ctx, auth.ID, &Error{
+				Code:       auth401KindUnknown,
+				Message:    "codex unknown 401 refresh failed: " + errRefresh.Error(),
+				HTTPStatus: http.StatusUnauthorized,
+			}, now)
+		}
+		return nil, errRefresh
+	}
+	if refreshed == nil {
+		refreshed = auth.Clone()
+	}
+	if refreshed.Runtime == nil {
+		refreshed.Runtime = auth.Runtime
+	}
+	refreshed.ModelStates = auth.ModelStates
+	refreshed.LastRefreshedAt = now
+	refreshed.LastError = auth.LastError
+	refreshed.StatusMessage = auth.StatusMessage
+	refreshed.Unavailable = auth.Unavailable
+	refreshed.NextRetryAfter = auth.NextRetryAfter
+	refreshed.NextRefreshAfter = auth.NextRefreshAfter
+	if _, errUpdate := m.Update(ctx, refreshed); errUpdate != nil {
+		return nil, errUpdate
+	}
+
+	errProbe := m.runCodexUsageProbe(ctx, refreshed, exec)
+	now = time.Now()
+	if errProbe != nil {
+		m.applyUnknown401ProbeFailure(ctx, auth.ID, errProbe, now)
+		return nil, errProbe
+	}
+
+	updated := refreshed.Clone()
+	clearAuthStateAfterSuccessfulRefresh(updated, now)
+	saved, errUpdate := m.Update(ctx, updated)
+	if errUpdate != nil {
+		return nil, errUpdate
+	}
+	if saved == nil {
+		return updated.Clone(), nil
+	}
+	return saved, nil
+}
+
+func shouldApplyTerminal401RefreshFailure(err error) bool {
+	resultErr := resultErrorFromExecutionError(err)
+	switch auth401QuarantineKind(resultErr) {
+	case auth401KindTokenInvalidated, auth401KindTokenRevoked, auth401KindAccountDeactivated, auth401KindTokenExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) runCodexUsageProbe(ctx context.Context, auth *Auth, exec ProviderExecutor) error {
+	accountID := strings.TrimSpace(stringValueFromMetadata(auth.Metadata, "account_id", "accountId"))
+	if accountID == "" {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe missing account_id", HTTPStatus: http.StatusUnauthorized}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageProbeURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", codexUsageProbeUserAgent)
+	req.Header.Set("Chatgpt-Account-Id", accountID)
+
+	resp, err := exec.HttpRequest(ctx, auth.Clone(), req)
+	if err != nil {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe failed: " + err.Error(), HTTPStatus: http.StatusUnauthorized}
+	}
+	if resp == nil {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe returned no response", HTTPStatus: http.StatusUnauthorized}
+	}
+	if resp.Body == nil {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe returned no body", HTTPStatus: http.StatusUnauthorized}
+	}
+	defer func() {
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.WithError(errClose).Debug("codex usage probe response close failed")
+		}
+	}()
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, codexUsageProbeBodyLimit))
+	if errRead != nil {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe read failed: " + errRead.Error(), HTTPStatus: http.StatusUnauthorized}
+	}
+	if resp.StatusCode == http.StatusOK {
+		if errUsage := resultErrorFromSuccessfulUsageProbe(string(body)); errUsage != nil {
+			return errUsage
+		}
+		return nil
+	}
+	return resultErrorFromUsageProbe(resp.StatusCode, string(body))
+}
+
+func resultErrorFromSuccessfulUsageProbe(body string) *Error {
+	trimmed := strings.TrimSpace(body)
+	if trimmed == "" {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+		return nil
+	}
+	if allowed, ok := boolJSONField(payload, "allowed"); ok && !allowed {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe returned allowed=false", HTTPStatus: http.StatusUnauthorized}
+	}
+	if limitReached, ok := boolJSONField(payload, "limit_reached", "limitReached"); ok && limitReached {
+		return &Error{Code: auth401KindUnknown, Message: "codex usage probe returned limit_reached=true", HTTPStatus: http.StatusUnauthorized}
+	}
+	return nil
+}
+
+func boolJSONField(payload map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		if raw, ok := payload[key]; ok {
+			if value, okBool := raw.(bool); okBool {
+				return value, true
+			}
+		}
+	}
+	return false, false
+}
+
+func resultErrorFromUsageProbe(statusCode int, body string) *Error {
+	message := strings.TrimSpace(body)
+	if message == "" {
+		message = http.StatusText(statusCode)
+	}
+	err := &Error{Message: message, HTTPStatus: statusCode}
+	if kind := auth401QuarantineKind(err); kind != auth401KindNone {
+		err.Code = kind
+		return err
+	}
+	if statusCode == http.StatusUnauthorized {
+		err.Code = auth401KindUnknown
+	}
+	return err
+}
+
+func (m *Manager) applyUnknown401ProbeFailure(ctx context.Context, id string, probeErr error, now time.Time) {
+	resultErr := resultErrorFromExecutionError(probeErr)
+	if resultErr == nil || auth401QuarantineKind(resultErr) == auth401KindNone && resultErr.HTTPStatus != http.StatusUnauthorized {
+		message := ""
+		if probeErr != nil {
+			message = probeErr.Error()
+		}
+		if message == "" {
+			message = "codex usage probe failed"
+		}
+		resultErr = &Error{Code: auth401KindUnknown, Message: message, HTTPStatus: http.StatusUnauthorized}
+	}
+	m.applyRefreshFailure(ctx, id, resultErr, now)
 }
 
 func (m *Manager) applyRefreshFailure(ctx context.Context, id string, refreshExecErr error, now time.Time) {
@@ -3656,7 +3838,7 @@ func codexQuarantineError(auth *Auth) error {
 	switch authWide401Quarantine(auth) {
 	case auth401KindNone:
 		return nil
-	case auth401KindTokenInvalidated, auth401KindAccountDeactivated, auth401KindTokenExpired:
+	case auth401KindTokenInvalidated, auth401KindTokenRevoked, auth401KindAccountDeactivated, auth401KindTokenExpired:
 		if auth.LastError != nil {
 			return auth.LastError
 		}

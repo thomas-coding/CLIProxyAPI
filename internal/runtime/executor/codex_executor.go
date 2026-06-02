@@ -55,9 +55,11 @@ const (
 
 type codexPreparedRequest struct {
 	body            []byte
+	translationBody []byte
 	request         *http.Request
 	originalPayload []byte
 	transparent     bool
+	identity        *codexAuthIdentityState
 }
 
 type codexTransparentSnapshot struct {
@@ -94,6 +96,8 @@ var codexTransparentAllowedRequestHeaders = map[string]struct{}{
 	textproto.CanonicalMIMEHeaderKey("X-Codex-Beta-Features"):                 {},
 	textproto.CanonicalMIMEHeaderKey("X-Codex-Turn-Metadata"):                 {},
 	textproto.CanonicalMIMEHeaderKey("X-Codex-Turn-State"):                    {},
+	textproto.CanonicalMIMEHeaderKey("X-Codex-Window-Id"):                     {},
+	textproto.CanonicalMIMEHeaderKey("X-Client-Request-Id"):                   {},
 	textproto.CanonicalMIMEHeaderKey("X-ResponsesAPI-Include-Timing-Metrics"): {},
 	textproto.CanonicalMIMEHeaderKey("X-Stainless-Arch"):                      {},
 	textproto.CanonicalMIMEHeaderKey("X-Stainless-Lang"):                      {},
@@ -103,6 +107,7 @@ var codexTransparentAllowedRequestHeaders = map[string]struct{}{
 	textproto.CanonicalMIMEHeaderKey("X-Stainless-Runtime"):                   {},
 	textproto.CanonicalMIMEHeaderKey("X-Stainless-Runtime-Version"):           {},
 	textproto.CanonicalMIMEHeaderKey("X-Stainless-Timeout"):                   {},
+	textproto.CanonicalMIMEHeaderKey("Thread-Id"):                             {},
 }
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
@@ -289,10 +294,22 @@ func (e *CodexExecutor) buildLegacyCodexRequest(ctx context.Context, auth *clipr
 		return codexPreparedRequest{}, err
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, kind != codexRequestKindResponsesCompact, e.cfg)
+	body, err = requestBodyBytes(httpReq)
+	if err != nil {
+		return codexPreparedRequest{}, fmt.Errorf("codex legacy request: read body: %w", err)
+	}
+	translationBody := bytes.Clone(body)
+	identityState := &codexAuthIdentityState{}
+	body, err = applyCodexAuthIdentity(httpReq, body, auth, identityState)
+	if err != nil {
+		return codexPreparedRequest{}, err
+	}
 	return codexPreparedRequest{
 		body:            body,
+		translationBody: translationBody,
 		request:         httpReq,
 		originalPayload: originalPayload,
+		identity:        identityState,
 	}, nil
 }
 
@@ -324,11 +341,19 @@ func (e *CodexExecutor) buildTransparentCodexRequest(ctx context.Context, auth *
 		return codexPreparedRequest{}, err
 	}
 	applyTransparentCodexHeaders(httpReq, auth, apiKey, e.cfg, kind == codexRequestKindResponsesStream, snapshot.headers)
+	translationBody := bytes.Clone(body)
+	identityState := &codexAuthIdentityState{}
+	body, err = applyCodexAuthIdentity(httpReq, body, auth, identityState)
+	if err != nil {
+		return codexPreparedRequest{}, err
+	}
 	return codexPreparedRequest{
 		body:            body,
+		translationBody: translationBody,
 		request:         httpReq,
 		originalPayload: originalPayload,
 		transparent:     true,
+		identity:        identityState,
 	}, nil
 }
 
@@ -344,6 +369,240 @@ func applyTransparentCodexBodyCompatibility(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return updated, nil
+}
+
+func requestBodyBytes(r *http.Request) ([]byte, error) {
+	if r == nil || r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	setRequestBodyBytes(r, body)
+	return body, nil
+}
+
+func setRequestBodyBytes(r *http.Request, body []byte) {
+	if r == nil {
+		return
+	}
+	body = bytes.Clone(body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+}
+
+type codexAuthIdentityState struct {
+	scope    string
+	toClient map[string]string
+}
+
+func applyCodexAuthIdentity(r *http.Request, body []byte, auth *cliproxyauth.Auth, state *codexAuthIdentityState) ([]byte, error) {
+	scope := codexAuthIdentityScope(auth)
+	if scope == "" {
+		setRequestBodyBytes(r, body)
+		return body, nil
+	}
+	if state == nil {
+		state = &codexAuthIdentityState{}
+	}
+	state.scope = scope
+	if state.toClient == nil {
+		state.toClient = make(map[string]string)
+	}
+
+	var err error
+	body, err = rewriteCodexBodyIdentity(body, state)
+	if err != nil {
+		return nil, err
+	}
+	rewriteCodexHeaderIdentity(r, state)
+	setRequestBodyBytes(r, body)
+	return body, nil
+}
+
+func codexAuthIdentityScope(auth *cliproxyauth.Auth) string {
+	if auth == nil || isCodexAPIKeyAuth(auth) {
+		return ""
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return "id:" + id
+	}
+	if index := strings.TrimSpace(auth.Index); index != "" {
+		return "index:" + index
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return "file:" + fileName
+	}
+	if auth.Metadata != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok {
+			if accountID = strings.TrimSpace(accountID); accountID != "" {
+				return "account:" + accountID
+			}
+		}
+		if email, ok := auth.Metadata["email"].(string); ok {
+			if email = strings.TrimSpace(email); email != "" {
+				return "email:" + strings.ToLower(email)
+			}
+		}
+	}
+	return ""
+}
+
+func isCodexAPIKeyAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	return strings.TrimSpace(auth.Attributes["api_key"]) != ""
+}
+
+func rewriteCodexBodyIdentity(body []byte, state *codexAuthIdentityState) ([]byte, error) {
+	if state == nil || strings.TrimSpace(state.scope) == "" || len(bytes.TrimSpace(body)) == 0 {
+		return body, nil
+	}
+	var err error
+	for _, path := range []string{
+		"prompt_cache_key",
+		"client_metadata.x-codex-installation-id",
+		"client_metadata.x-codex-window-id",
+	} {
+		value := gjson.GetBytes(body, path)
+		if !value.Exists() || value.Type != gjson.String {
+			continue
+		}
+		original := strings.TrimSpace(value.String())
+		if original == "" {
+			continue
+		}
+		body, err = sjson.SetBytes(body, path, state.scoped(original))
+		if err != nil {
+			return nil, fmt.Errorf("codex auth identity: rewrite %s: %w", path, err)
+		}
+	}
+
+	turnMetadataPath := "client_metadata.x-codex-turn-metadata"
+	turnMetadata := gjson.GetBytes(body, turnMetadataPath)
+	if turnMetadata.Exists() && turnMetadata.Type == gjson.String {
+		if rewritten, changed, turnErr := rewriteCodexTurnMetadataIdentity(turnMetadata.String(), state); turnErr != nil {
+			return nil, fmt.Errorf("codex auth identity: rewrite %s: %w", turnMetadataPath, turnErr)
+		} else if changed {
+			body, err = sjson.SetBytes(body, turnMetadataPath, rewritten)
+			if err != nil {
+				return nil, fmt.Errorf("codex auth identity: rewrite %s: %w", turnMetadataPath, err)
+			}
+		}
+	}
+	return body, nil
+}
+
+func rewriteCodexHeaderIdentity(r *http.Request, state *codexAuthIdentityState) {
+	if r == nil || r.Header == nil || state == nil || strings.TrimSpace(state.scope) == "" {
+		return
+	}
+	for _, name := range []string{
+		"Session_id",
+		"Conversation_id",
+		"X-Client-Request-Id",
+		"Thread-Id",
+		"X-Codex-Window-Id",
+	} {
+		value := strings.TrimSpace(r.Header.Get(name))
+		if value == "" {
+			continue
+		}
+		r.Header.Set(name, state.scoped(value))
+	}
+	if value := strings.TrimSpace(r.Header.Get("X-Codex-Turn-Metadata")); value != "" {
+		if rewritten, changed, err := rewriteCodexTurnMetadataIdentity(value, state); err == nil && changed {
+			r.Header.Set("X-Codex-Turn-Metadata", rewritten)
+		}
+	}
+}
+
+func rewriteCodexTurnMetadataIdentity(raw string, state *codexAuthIdentityState) (string, bool, error) {
+	if strings.TrimSpace(raw) == "" || state == nil || strings.TrimSpace(state.scope) == "" {
+		return raw, false, nil
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return raw, false, nil
+	}
+	changed := false
+	for _, key := range []string{"prompt_cache_key", "turn_id", "window_id"} {
+		value, ok := metadata[key].(string)
+		if !ok {
+			continue
+		}
+		original := strings.TrimSpace(value)
+		if original == "" {
+			continue
+		}
+		metadata[key] = state.scoped(original)
+		changed = true
+	}
+	if !changed {
+		return raw, false, nil
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", false, err
+	}
+	return string(encoded), true, nil
+}
+
+func (s *codexAuthIdentityState) scoped(original string) string {
+	if s == nil {
+		return original
+	}
+	original = strings.TrimSpace(original)
+	if original == "" || strings.TrimSpace(s.scope) == "" {
+		return original
+	}
+	if s.toClient == nil {
+		s.toClient = make(map[string]string)
+	}
+	for scoped, existingOriginal := range s.toClient {
+		if existingOriginal == original {
+			return scoped
+		}
+	}
+	scoped := codexAuthScopedIdentity(s.scope, "identity", original)
+	s.toClient[scoped] = original
+	return scoped
+}
+
+func codexAuthScopedIdentity(scope, kind, original string) string {
+	scope = strings.TrimSpace(scope)
+	kind = strings.TrimSpace(kind)
+	original = strings.TrimSpace(original)
+	if scope == "" || kind == "" || original == "" {
+		return original
+	}
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:auth-identity:"+scope+":"+kind+":"+original)).String()
+}
+
+func exposeCodexAuthIdentityPayload(payload []byte, state *codexAuthIdentityState) []byte {
+	if len(payload) == 0 || state == nil || len(state.toClient) == 0 {
+		return payload
+	}
+	out := bytes.Clone(payload)
+	for scoped, original := range state.toClient {
+		if scoped == "" || original == "" || scoped == original {
+			continue
+		}
+		out = bytes.ReplaceAll(out, []byte(scoped), []byte(original))
+	}
+	return out
+}
+
+func codexTranslationBody(prepared codexPreparedRequest) []byte {
+	if len(prepared.translationBody) > 0 {
+		return prepared.translationBody
+	}
+	return prepared.body
 }
 
 func applyTransparentCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, cfg *config.Config, stream bool, snapshotHeaders http.Header) {
@@ -828,8 +1087,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}()
 		b, _ := io.ReadAll(decodedBody)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		clientBody := exposeCodexAuthIdentityPayload(b, prepared.identity)
+		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), clientBody))
+		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -848,20 +1108,21 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
+	clientData := exposeCodexAuthIdentityPayload(data, prepared.identity)
 
-	if line := firstCompletedEvent(data); len(line) > 0 {
+	if line := firstCompletedEvent(clientData); len(line) > 0 {
 		if detail, ok := parseCodexUsage(line); ok {
 			reporter.publish(ctx, detail)
 		}
 		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, prepared.originalPayload, prepared.body, line, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, prepared.originalPayload, codexTranslationBody(prepared), line, &param)
 		resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
-	if shouldPassthroughTransparentOpenAIResponse(prepared, from, data) {
-		reporter.publish(ctx, parseOpenAIUsage(data))
+	if shouldPassthroughTransparentOpenAIResponse(prepared, from, clientData) {
+		reporter.publish(ctx, parseOpenAIUsage(clientData))
 		reporter.ensurePublished(ctx)
-		resp = cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}
+		resp = cliproxyexecutor.Response{Payload: clientData, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
 	err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
@@ -923,8 +1184,9 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		}()
 		b, _ := io.ReadAll(decodedBody)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		clientBody := exposeCodexAuthIdentityPayload(b, prepared.identity)
+		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), clientBody))
+		err = newCodexStatusErr(httpResp.StatusCode, clientBody)
 		return resp, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -943,14 +1205,15 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
-	reporter.publish(ctx, parseOpenAIUsage(data))
+	clientData := exposeCodexAuthIdentityPayload(data, prepared.identity)
+	reporter.publish(ctx, parseOpenAIUsage(clientData))
 	reporter.ensurePublished(ctx)
-	if shouldPassthroughTransparentOpenAIResponse(prepared, from, data) {
-		resp = cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}
+	if shouldPassthroughTransparentOpenAIResponse(prepared, from, clientData) {
+		resp = cliproxyexecutor.Response{Payload: clientData, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, prepared.originalPayload, prepared.body, data, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, prepared.originalPayload, codexTranslationBody(prepared), clientData, &param)
 	resp = cliproxyexecutor.Response{Payload: []byte(out), Headers: httpResp.Header.Clone()}
 	return resp, nil
 }
@@ -1016,8 +1279,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			return nil, readErr
 		}
 		appendAPIResponseChunk(ctx, e.cfg, data)
-		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
+		clientData := exposeCodexAuthIdentityPayload(data, prepared.identity)
+		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), clientData))
+		err = newCodexStatusErr(httpResp.StatusCode, clientData)
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -1042,9 +1306,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
+			clientLine := exposeCodexAuthIdentityPayload(line, prepared.identity)
 
-			if bytes.HasPrefix(line, dataTag) {
-				data := bytes.TrimSpace(line[5:])
+			if bytes.HasPrefix(clientLine, dataTag) {
+				data := bytes.TrimSpace(clientLine[5:])
 				if gjson.GetBytes(data, "type").String() == "response.completed" {
 					sawCompleted = true
 					if detail, ok := parseCodexUsage(data); ok {
@@ -1053,7 +1318,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, prepared.originalPayload, prepared.body, bytes.Clone(line), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, prepared.originalPayload, codexTranslationBody(prepared), bytes.Clone(clientLine), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}

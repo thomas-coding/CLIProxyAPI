@@ -9,8 +9,10 @@ import (
 const (
 	auth401KindNone               = ""
 	auth401KindTokenInvalidated   = "token_invalidated"
+	auth401KindTokenRevoked       = "token_revoked"
 	auth401KindAccountDeactivated = "account_deactivated"
 	auth401KindTokenExpired       = "token_expired"
+	auth401KindUnknown            = "unknown_401"
 	auth401ProbeInterval          = 24 * time.Hour
 )
 
@@ -36,8 +38,12 @@ func auth401QuarantineKind(err *Error) string {
 func auth401QuarantineKindText(raw string) string {
 	lower := strings.ToLower(strings.TrimSpace(raw))
 	switch {
+	case lower == auth401KindUnknown || strings.Contains(lower, auth401KindUnknown):
+		return auth401KindUnknown
 	case lower == auth401KindTokenInvalidated || strings.Contains(lower, auth401KindTokenInvalidated):
 		return auth401KindTokenInvalidated
+	case lower == auth401KindTokenRevoked || strings.Contains(lower, auth401KindTokenRevoked):
+		return auth401KindTokenRevoked
 	case strings.Contains(lower, "refresh_token_reused"),
 		strings.Contains(lower, "refresh_token_invalidated"):
 		return auth401KindTokenInvalidated
@@ -72,6 +78,9 @@ func auth401QuarantineKindFromMessage(message string) string {
 	case strings.Contains(lower, "authentication token has been invalidated"),
 		strings.Contains(lower, "token invalidated"):
 		return auth401KindTokenInvalidated
+	case strings.Contains(lower, "invalidated oauth token"),
+		strings.Contains(lower, "token revoked"):
+		return auth401KindTokenRevoked
 	case strings.Contains(lower, "account has been deactivated"),
 		strings.Contains(lower, "account deactivated"),
 		strings.Contains(lower, "deactivated"):
@@ -128,7 +137,7 @@ func authWide401NextProbe(auth *Auth) time.Time {
 
 func authWide401BlockState(auth *Auth, now time.Time) (bool, time.Time) {
 	switch authWide401Quarantine(auth) {
-	case auth401KindTokenInvalidated:
+	case auth401KindTokenInvalidated, auth401KindTokenRevoked, auth401KindUnknown:
 		next := authWide401NextProbe(auth)
 		if !next.IsZero() && next.Before(now) {
 			next = now
@@ -149,6 +158,9 @@ func auth401QuarantineKindForAuth(auth *Auth, err *Error, now time.Time) string 
 	}
 	if auth401TokenExpired(err) && isHardExpiredCodexAuthWithoutRefresh(auth, now) {
 		return auth401KindTokenExpired
+	}
+	if auth != nil && err != nil && err.HTTPStatus == 401 && isCodexProvider(auth.Provider) && !auth401TokenExpired(err) {
+		return auth401KindUnknown
 	}
 	return auth401KindNone
 }
@@ -285,12 +297,12 @@ func applyAuth401Quarantine(auth *Auth, resultErr *Error, now time.Time) {
 	}
 
 	switch auth401QuarantineKindForAuth(auth, normalizedErr, now) {
-	case auth401KindTokenInvalidated:
+	case auth401KindTokenInvalidated, auth401KindTokenRevoked, auth401KindUnknown:
 		probeAt := now.Add(auth401ProbeInterval)
 		auth.NextRetryAfter = probeAt
 		auth.NextRefreshAfter = probeAt
 		if auth.StatusMessage == "" {
-			auth.StatusMessage = auth401KindTokenInvalidated
+			auth.StatusMessage = auth401QuarantineKindForAuth(auth, normalizedErr, now)
 		}
 	case auth401KindAccountDeactivated:
 		auth.NextRetryAfter = time.Time{}

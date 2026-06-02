@@ -317,8 +317,8 @@ func TestCodexExecutorExecute_TransparentOnPreservesClientShape(t *testing.T) {
 	if got := seenHeaders.Get("Version"); got != "client-version" {
 		t.Fatalf("Version = %q, want %q", got, "client-version")
 	}
-	if got := seenHeaders.Get("Session_id"); got != "client-session" {
-		t.Fatalf("Session_id = %q, want %q", got, "client-session")
+	if want := codexAuthScopedIdentity(codexAuthIdentityScope(auth), "identity", "client-session"); seenHeaders.Get("Session_id") != want {
+		t.Fatalf("Session_id = %q, want %q", seenHeaders.Get("Session_id"), want)
 	}
 	if got := seenHeaders.Get("Originator"); got != "client-originator" {
 		t.Fatalf("Originator = %q, want %q", got, "client-originator")
@@ -679,8 +679,8 @@ func TestCodexExecutorExecute_TransparentOnPrefersClientSnapshotHeadersAndQuery(
 	if got := seenHeaders.Get("Version"); got != "client-version" {
 		t.Fatalf("Version = %q, want %q", got, "client-version")
 	}
-	if got := seenHeaders.Get("Session_id"); got != "client-session" {
-		t.Fatalf("Session_id = %q, want %q", got, "client-session")
+	if want := codexAuthScopedIdentity(codexAuthIdentityScope(auth), "identity", "client-session"); seenHeaders.Get("Session_id") != want {
+		t.Fatalf("Session_id = %q, want %q", seenHeaders.Get("Session_id"), want)
 	}
 	if got := seenHeaders.Get("Originator"); got != "client-originator" {
 		t.Fatalf("Originator = %q, want %q", got, "client-originator")
