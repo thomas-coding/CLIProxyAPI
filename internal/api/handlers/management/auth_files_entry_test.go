@@ -147,3 +147,32 @@ func TestBuildAuthFileEntry_DoesNotDeriveRuntimeErrorForActiveAuth(t *testing.T)
 		t.Fatalf("expected no derived last_error for active auth, got %#v", entry["last_error"])
 	}
 }
+
+func TestBuildAuthFileEntry_ExposesCodexAccountIDFallback(t *testing.T) {
+	h := &Handler{}
+
+	entry := h.buildAuthFileEntry(&coreauth.Auth{
+		ID:       "codex-user.json",
+		FileName: "codex-user.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": "/tmp/codex-user.json",
+		},
+		Metadata: map[string]any{
+			"type":       "codex",
+			"email":      "active@example.com",
+			"account_id": "acct-123",
+		},
+	})
+
+	if entry == nil {
+		t.Fatal("expected entry")
+	}
+	if got := entry["account_id"]; got != "acct-123" {
+		t.Fatalf("account_id = %#v, want acct-123", got)
+	}
+	if got := entry["chatgpt_account_id"]; got != "acct-123" {
+		t.Fatalf("chatgpt_account_id = %#v, want acct-123", got)
+	}
+}

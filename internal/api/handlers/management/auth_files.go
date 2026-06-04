@@ -437,8 +437,37 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
+		if raw, ok := claims["chatgpt_account_id"]; ok {
+			v := strings.TrimSpace(fmt.Sprint(raw))
+			if v != "" {
+				entry["chatgpt_account_id"] = v
+			}
+		}
+	}
+	if accountID := codexAccountID(auth); accountID != "" {
+		entry["account_id"] = accountID
+		if _, ok := entry["chatgpt_account_id"]; !ok {
+			entry["chatgpt_account_id"] = accountID
+		}
 	}
 	return entry
+}
+
+func codexAccountID(auth *coreauth.Auth) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return ""
+	}
+	for _, key := range []string{"chatgpt_account_id", "account_id"} {
+		if v, ok := auth.Metadata[key].(string); ok {
+			if trimmed := strings.TrimSpace(v); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
