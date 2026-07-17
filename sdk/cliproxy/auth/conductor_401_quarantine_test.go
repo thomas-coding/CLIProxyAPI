@@ -852,11 +852,17 @@ func TestManager_refreshAuth_TerminalRefreshTokenCodeMovesAuthToWarehouse(t *tes
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		code string
+		name    string
+		code    string
+		message string
 	}{
-		{name: "reused", code: "refresh_token_reused"},
-		{name: "invalidated", code: "refresh_token_invalidated"},
+		{name: "reused", code: "refresh_token_reused", message: "terminal refresh token failure"},
+		{name: "invalidated", code: "refresh_token_invalidated", message: "terminal refresh token failure"},
+		{name: "invalid-refresh-token-code", code: "invalid_refresh_token", message: "terminal refresh token failure"},
+		{
+			name:    "invalid-refresh-token-openai-message",
+			message: `{"error":{"message":"Could not validate your refresh token. Please try signing in again.","type":"invalid_request_error","param":null,"code":"invalid_refresh_token"}}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -873,7 +879,7 @@ func TestManager_refreshAuth_TerminalRefreshTokenCodeMovesAuthToWarehouse(t *tes
 					return nil, &Error{
 						Code:       tt.code,
 						HTTPStatus: http.StatusUnauthorized,
-						Message:    "terminal refresh token failure",
+						Message:    tt.message,
 					}
 				},
 			})

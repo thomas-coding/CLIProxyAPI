@@ -45,7 +45,9 @@ func auth401QuarantineKindText(raw string) string {
 	case lower == auth401KindTokenRevoked || strings.Contains(lower, auth401KindTokenRevoked):
 		return auth401KindTokenRevoked
 	case strings.Contains(lower, "refresh_token_reused"),
-		strings.Contains(lower, "refresh_token_invalidated"):
+		strings.Contains(lower, "refresh_token_invalidated"),
+		strings.Contains(lower, "invalid_refresh_token"),
+		strings.Contains(lower, "could not validate your refresh token"):
 		return auth401KindTokenInvalidated
 	case lower == auth401KindAccountDeactivated || strings.Contains(lower, auth401KindAccountDeactivated):
 		return auth401KindAccountDeactivated
@@ -237,7 +239,9 @@ func isTerminalRefreshToken401(err *Error) bool {
 func terminalRefreshToken401Text(raw string) bool {
 	lower := strings.ToLower(strings.TrimSpace(raw))
 	return strings.Contains(lower, "refresh_token_reused") ||
-		strings.Contains(lower, "refresh_token_invalidated")
+		strings.Contains(lower, "refresh_token_invalidated") ||
+		strings.Contains(lower, "invalid_refresh_token") ||
+		strings.Contains(lower, "could not validate your refresh token")
 }
 
 func stringValueFromMetadata(meta map[string]any, keys ...string) string {
